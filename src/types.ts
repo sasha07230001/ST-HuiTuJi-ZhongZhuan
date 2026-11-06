@@ -66,6 +66,17 @@ export interface Settings {
   relay: RelayChannel;
   comfy: ComfyChannel;
   prompt: PromptSettings;
+  /** 悬浮球配置。位置这类纯视觉态走 localStorage,这里只放需要跨设备同步的开关。 */
+  orb: OrbSettings;
+}
+
+export interface OrbSettings {
+  /** 是否显示悬浮球。关掉后仍可用顶栏菜单打开面板。 */
+  show: boolean;
+  /** 球体基准尺寸(px)。 */
+  size: number;
+  /** 静止时的不透明度(0.2 ~ 1)。 */
+  opacity: number;
 }
 
 export const DEFAULT_SYSTEM_PROMPT = `你是 Stable Diffusion 的提示词工程师。把下面这段剧情正文编译成给 ComfyUI 用的 CLIP 文本提示词。
@@ -110,6 +121,11 @@ export const DEFAULT_SETTINGS: Settings = {
     wantNegative: false,
     maxImages: 1,
     retryCount: 1,
+  },
+  orb: {
+    show: true,
+    size: 48,
+    opacity: 0.62,
   },
 };
 

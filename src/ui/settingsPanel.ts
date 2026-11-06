@@ -11,27 +11,12 @@ import { fetchRelayModels, testRelayConnection } from '@/relay/client';
 import { normalizeRelayUrl } from '@/relay/prompt';
 import { getSettings, saveSettings } from '@/state/settings';
 import { BUILTIN_WORKFLOW, DEFAULT_SETTINGS, type Settings } from '@/types';
+import { el, toast } from '@/ui/dom';
+import { resetOrbPosition, syncOrb } from '@/ui/orb';
+import { openPanel } from '@/ui/panel';
 
 const PANEL_ID = 'htj-zz-settings';
 export const TITLE = '绘图姬·中转站';
-
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  attrs: Record<string, string> = {},
-  ...children: (Node | string | null | undefined)[]
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(attrs)) {
-    if (key === 'class') node.className = value;
-    else if (key === 'text') node.textContent = value;
-    else node.setAttribute(key, value);
-  }
-  for (const child of children) {
-    if (child === null || child === undefined) continue;
-    node.append(typeof child === 'string' ? document.createTextNode(child) : child);
-  }
-  return node;
-}
 
 function field(label: string, input: HTMLElement, hint?: string): HTMLElement {
   return el(
@@ -41,13 +26,6 @@ function field(label: string, input: HTMLElement, hint?: string): HTMLElement {
     input,
     hint ? el('small', { class: 'htj-zz-hint', text: hint }) : null,
   );
-}
-
-function toast(message: string, kind: 'info' | 'success' | 'warning' | 'error' = 'info'): void {
-  const t = (window as unknown as { toastr?: Record<string, (msg: string, title: string) => void> }).toastr;
-  const fn = t?.[kind] ?? t?.info;
-  if (fn) fn.call(t, message, TITLE);
-  else console.log(`[${TITLE}] ${message}`);
 }
 
 function textInput(value: string, placeholder = '', type = 'text'): HTMLInputElement {
@@ -214,6 +192,33 @@ function buildPanel(): HTMLElement {
     toast('已恢复默认编译提示词', 'success');
   });
 
+  /* ---- 悬浮球 / 面板入口 ---- */
+  const orbShow = checkboxInput(s.orb.show);
+  orbShow.addEventListener('change', () => {
+    write(next => (next.orb.show = orbShow.checked));
+    syncOrb();
+  });
+  const orbSize = textInput(String(s.orb.size), '48', 'number');
+  orbSize.addEventListener('change', () => {
+    write(next => (next.orb.size = Math.max(28, Math.min(96, Number(orbSize.value) || 48))));
+    syncOrb();
+  });
+  const orbOpacity = textInput(String(s.orb.opacity), '0.62', 'number');
+  orbOpacity.step = '0.05';
+  orbOpacity.addEventListener('change', () => {
+    write(next => (next.orb.opacity = Math.min(1, Math.max(0.2, Number(orbOpacity.value) || 0.62))));
+    syncOrb();
+  });
+
+  const openPanelBtn = el('button', { class: 'menu_button', type: 'button', text: '打开面板' });
+  openPanelBtn.addEventListener('click', () => openPanel('render'));
+
+  const resetOrbBtn = el('button', { class: 'menu_button', type: 'button', text: '悬浮球回到默认位置' });
+  resetOrbBtn.addEventListener('click', () => {
+    resetOrbPosition();
+    toast('悬浮球已回到默认位置', 'success');
+  });
+
   return el(
     'div',
     { class: 'inline-drawer' },
@@ -273,6 +278,16 @@ function buildPanel(): HTMLElement {
         el('label', { class: 'checkbox_label' }, wantNegative, el('span', { text: '让模型额外输出负面词' })),
         field('失败重试次数', retryInput),
         resetPrompt,
+      ),
+
+      el(
+        'fieldset',
+        {},
+        el('legend', { text: '悬浮球 / 面板' }),
+        el('label', { class: 'checkbox_label' }, orbShow, el('span', { text: '显示悬浮球' })),
+        el('div', { class: 'htj-zz-row' }, field('大小(px)', orbSize), field('不透明度(0.2~1)', orbOpacity)),
+        el('div', { class: 'htj-zz-row' }, openPanelBtn, resetOrbBtn),
+        el('small', { class: 'htj-zz-hint', text: '点悬浮球打开面板;拖动可移动,靠近左右边缘会吸附,双击回到默认位置。' }),
       ),
 
       status,

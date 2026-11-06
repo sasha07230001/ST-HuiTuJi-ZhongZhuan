@@ -62,10 +62,22 @@ const logs = [];
 const errors = [];
 const origLog = console.log;
 const origErr = console.error;
+
+/** Node 自身的运行时提示(与插件无关)不算失败。 */
+const isNoise = (text) =>
+  /ExperimentalWarning|--localstorage-file|--trace-warnings|trace-deprecation/i.test(text);
+
 console.log = (...a) => { logs.push(a.join(' ')); origLog(...a); };
-console.error = (...a) => { errors.push(a.join(' ')); origErr(...a); };
+console.error = (...a) => {
+  const line = a.join(' ');
+  if (!isNoise(line)) errors.push(line);
+  origErr(...a);
+};
 window.addEventListener('error', (e) => errors.push('window.error: ' + e.message));
 window.addEventListener('unhandledrejection', (e) => errors.push('unhandledrejection: ' + e.reason));
+process.on('warning', (w) => {
+  if (!isNoise(String(w?.name || w?.message))) errors.push('process.warning: ' + (w?.message || w));
+});
 
 // ---- 真实执行 bundle(作为 ES module) ----
 // 把 jsdom 的 window/document 装到 Node 的 globalThis 上,再用 Node 的模块加载器
@@ -107,6 +119,47 @@ check('已绑定 ST 渲染事件', (listeners['character_message_rendered'] ?? [
 check('启动日志出现版本号', logs.some((l) => l.includes('已加载')));
 // 模块在 Node 侧求值,globalThis 即 Node 的 global;浏览器里两者本就是同一个对象。
 check('全局入口 htjZhongZhuan 存在', typeof globalThis.htjZhongZhuan === 'object' && !!globalThis.htjZhongZhuan?.generate);
+
+// ---- 悬浮球 ----
+const orb = window.document.getElementById('htj-zz-orb');
+check('悬浮球已挂载', !!orb);
+check('悬浮球有可点击语义', orb?.getAttribute('role') === 'button' && orb?.getAttribute('tabindex') === '0');
+check('悬浮球默认可视(fixed 定位)', orb?.style.position === '' && getComputedStyleSafe(orb, 'position') !== 'none');
+
+// ---- 面板:点击悬浮球 → 打开 ----
+if (orb) {
+  orb.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, clientX: 10, clientY: 10 }));
+  orb.dispatchEvent(new window.MouseEvent('pointerup', { bubbles: true, clientX: 10, clientY: 10 }));
+}
+await new Promise((r) => setTimeout(r, 50));
+const mask = window.document.getElementById('htj-zz-panel-mask');
+check('点击悬浮球打开面板', !!mask && mask.style.display !== 'none');
+check('面板有三个页签', (mask?.querySelectorAll('.htj-zz-tab').length ?? 0) === 3);
+check('出图页可见', !!mask?.querySelector('.htj-zz-page[data-page="render"], .htj-zz-page'));
+check('面板打开时悬浮球被隐藏', orb?.style.display === 'none');
+
+// 页签切换
+const tabs = [...(mask?.querySelectorAll('.htj-zz-tab') ?? [])];
+const channelTab = tabs.find((t) => t.dataset.tab === 'channel');
+channelTab?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+await new Promise((r) => setTimeout(r, 30));
+check('切到渠道页:出现 ComfyUI 地址输入', !!channelTab?.classList.contains('is-active'));
+check('渠道页有工作流文本框', !!window.document.querySelector('.htj-zz-textarea'));
+
+// Esc 关闭
+window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+await new Promise((r) => setTimeout(r, 30));
+check('Esc 关闭面板', !window.document.getElementById('htj-zz-panel-mask'));
+check('关闭后悬浮球恢复显示', orb?.style.display !== 'none');
+
+function getComputedStyleSafe(node, prop) {
+  try {
+    return node ? window.getComputedStyle(node)[prop] : '';
+  } catch {
+    return '';
+  }
+}
+
 if (window.__htjLoadError) errors.push('bundle 加载失败: ' + window.__htjLoadError);
 
 origLog('\n=== 冒烟测试结果 ===');

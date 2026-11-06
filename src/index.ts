@@ -12,6 +12,8 @@ import { getContext, reloadMessageDom, waitForContext } from '@/st/context';
 import { bindAutoRun } from '@/ui/autoRun';
 import { cardPlaceholder, generateIntoFloor, hydrateAll, hydrateFloor, stripCardPlaceholders } from '@/ui/card';
 import { bindFloorButtons, decorateAllFloors } from '@/ui/floorButton';
+import { syncOrb } from '@/ui/orb';
+import { togglePanel } from '@/ui/panel';
 import { mountSettingsPanel, TITLE } from '@/ui/settingsPanel';
 
 declare const __HTJ_ZZ_VERSION__: string;
@@ -50,11 +52,12 @@ async function autoRunFloor(floor: number): Promise<void> {
   });
 }
 
-/** 顶栏菜单:一键为最新一楼出图。 */
+/** 顶栏菜单:打开面板。 */
 function addTopBarButton(): void {
   const ctx = getContext();
   const menu = document.getElementById('extensionsMenu');
   if (!menu || !ctx) return;
+  if (document.getElementById('htj-zz-topbar')) return;
   const item = document.createElement('div');
   item.className = 'extension_container interactable';
   item.id = 'htj-zz-topbar';
@@ -63,16 +66,10 @@ function addTopBarButton(): void {
   button.className = 'list-group-item flex-container flexGap5 interactable';
   button.tabIndex = 0;
   button.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i><span>绘图姬·中转站</span>';
+  // 顶栏入口 = 打开面板(不再是「直接给最新一楼出图」)。
+  // 出图页默认选中最新一楼,点「编译并出图」就行,也能手填正文 / 改提示词。
   button.addEventListener('click', () => {
-    if (!isReady()) {
-      const toastr = (window as unknown as { toastr?: { warning?: (m: string, t: string) => void } }).toastr;
-      toastr?.warning?.('中转站或 ComfyUI 还没配置完整,去扩展设置里填一下', TITLE);
-      return;
-    }
-    const ctxNow = getContext();
-    const floor = (ctxNow?.chat?.length ?? 0) - 1;
-    if (floor < 0) return;
-    void autoRunFloor(floor);
+    togglePanel('render');
   });
 
   item.append(button);
@@ -143,6 +140,13 @@ async function boot(): Promise<void> {
     console.error(`[${TITLE}] 顶栏按钮挂载失败`, error);
   }
 
+  // 悬浮球:设置里开着就挂上。它不依赖 ST 事件,纯 DOM,失败也不该拖垮其它部分。
+  try {
+    syncOrb();
+  } catch (error) {
+    console.error(`[${TITLE}] 悬浮球挂载失败`, error);
+  }
+
   const events = ctx.eventTypes ?? ctx.event_types;
   if (events) {
     ctx.eventSource.on(events.CHARACTER_MESSAGE_RENDERED, (messageId: unknown) => {
@@ -174,5 +178,6 @@ globalThisAny.htjZhongZhuan = {
   version: VERSION,
   generate: (floor: number) => generateIntoFloor(floor),
   generateWithStory: (story: string) => generateIntoFloor(-1, { story }),
+  openPanel: (tab?: 'render' | 'channel' | 'prompt') => togglePanel(tab ?? 'render'),
   openSettings: () => document.getElementById('htj-zz-settings')?.scrollIntoView({ behavior: 'smooth' }),
 };
