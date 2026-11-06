@@ -8,9 +8,9 @@
  */
 
 import { getSettings, isReady } from '@/state/settings';
-import { getContext, reloadMessageDom, waitForContext } from '@/st/context';
-import { bindAutoRun } from '@/ui/autoRun';
-import { cardPlaceholder, generateIntoFloor, hydrateAll, hydrateFloor, stripCardPlaceholders } from '@/ui/card';
+import { getContext, waitForContext } from '@/st/context';
+import { bindAutoIllustrate } from '@/ui/autoIllustrate';
+import { generateIntoFloor, hydrateAll, hasLegacyPlaceholder, stripCardPlaceholders } from '@/ui/card';
 import { bindFloorButtons, decorateAllFloors } from '@/ui/floorButton';
 import { syncOrb } from '@/ui/orb';
 import { togglePanel } from '@/ui/panel';
@@ -22,34 +22,6 @@ const VERSION = typeof __HTJ_ZZ_VERSION__ === 'string' ? __HTJ_ZZ_VERSION__ : 'd
 
 function info(message: string): void {
   console.log(`[${TITLE}] ${message}`);
-}
-
-/** 自动流程:在某楼末尾追加卡片占位符并就地出图。 */
-async function autoRunFloor(floor: number): Promise<void> {
-  const ctx = getContext();
-  const message = ctx?.chat?.[floor];
-  if (!ctx || !message) return;
-  if (!isReady()) {
-    const toastr = (window as unknown as { toastr?: { warning?: (m: string, t: string) => void } }).toastr;
-    toastr?.warning?.('中转站或 ComfyUI 还没配置完整,去扩展设置里填一下', TITLE);
-    return;
-  }
-
-  const placeholder = cardPlaceholder(0);
-  if (!message.mes.includes(placeholder)) {
-    message.mes = `${stripCardPlaceholders(message.mes)}\n\n${placeholder}`;
-    await ctx.saveChat?.();
-    reloadMessageDom(floor);
-  }
-
-  // 等 ST 把占位符渲染成 card 容器后再往里画
-  await new Promise(resolve => setTimeout(resolve, 60));
-  hydrateFloor(floor);
-
-  await generateIntoFloor(floor, {
-    story: stripCardPlaceholders(message.mes),
-    note: '自动模式:用这一楼的正文编译一张最贴合当前画面的插图提示词。',
-  });
 }
 
 /** 顶栏菜单:打开面板。 */
@@ -74,6 +46,33 @@ function addTopBarButton(): void {
 
   item.append(button);
   menu.append(item);
+}
+
+/**
+ * 一次性清洗:早期版本把 `<htj-zz-card>` 写进了 message.mes。
+ * 那些标签让用户自己的正则(状态美化 / 选项美化)匹配区间被破坏,状态栏退化成源码。
+ * 这里把正文里残留的标签洗掉并落盘,让正则重新正常渲染。
+ * 只在真的存在残留时才写盘。
+ */
+async function purgeLegacyPlaceholders(): Promise<void> {
+  const ctx = getContext();
+  if (!ctx?.chat?.length) return;
+  let cleaned = 0;
+  for (const message of ctx.chat) {
+    if (typeof message?.mes !== 'string' || !hasLegacyPlaceholder(message.mes)) continue;
+    message.mes = stripCardPlaceholders(message.mes);
+    cleaned += 1;
+  }
+  if (!cleaned) return;
+  await ctx.saveChat?.();
+  info(`已清理 ${cleaned} 条消息里的旧占位符,正在重渲染`);
+  // 重渲染受影响楼层,让正则重新美化
+  try {
+    const reload = ctx.reloadCurrentChat as (() => Promise<void>) | undefined;
+    if (typeof reload === 'function') void reload.call(ctx);
+  } catch {
+    /* 没有该 API 时用户手刷一下页面即可 */
+  }
 }
 
 /**
@@ -117,21 +116,27 @@ async function boot(): Promise<void> {
   }
 
   try {
+    await purgeLegacyPlaceholders();
+  } catch (error) {
+    console.error(`[${TITLE}] 清理旧占位符失败`, error);
+  }
+
+  try {
     hydrateAll();
   } catch (error) {
     console.error(`[${TITLE}] 卡片水合失败`, error);
   }
 
   try {
-    bindAutoRun({
+    bindAutoIllustrate({
       enabled: () => {
         const s = getSettings();
         return s.enabled && s.autoRun;
       },
-      run: autoRunFloor,
+      ready: () => isReady(),
     });
   } catch (error) {
-    console.error(`[${TITLE}] 自动流程绑定失败`, error);
+    console.error(`[${TITLE}] 自动插图绑定失败`, error);
   }
 
   try {
@@ -153,7 +158,7 @@ async function boot(): Promise<void> {
       const floor = Number(messageId);
       if (Number.isInteger(floor) && floor >= 0) {
         setTimeout(() => {
-          hydrateFloor(floor);
+          hydrateAll();
           decorateAllFloors();
         }, 50);
       }

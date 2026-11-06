@@ -53,19 +53,24 @@ export function setCardRecord(key: string, record: CardRecord): void {
   records.set(key, record);
 }
 
-/** 正文里插入的占位符文本。 */
-export function cardPlaceholder(seq = 0): string {
-  return `<${TAG_NAME} seq="${seq}"></${TAG_NAME}>`;
-}
-
-/** 删掉正文里的占位符(重新生成时先清理)。 */
+/**
+ * 旧版本残留的占位符清理器。
+ *
+ * 本扩展现在**不再往正文写占位符**;这个函数只用于把旧版留在聊天记录里的
+ * `<htj-zz-card>` 洗掉(那些正是破坏用户正则的元凶)。新代码不应调用它以外的写操作。
+ */
 export function stripCardPlaceholders(text: string): string {
   return text.replace(new RegExp(`<${TAG_NAME}[\\s\\S]*?</${TAG_NAME}>`, 'gi'), '').trimEnd();
 }
 
+/** 判断正文里是否残留旧版占位符。 */
+export function hasLegacyPlaceholder(text: string): boolean {
+  return new RegExp(`<${TAG_NAME}`, 'i').test(text);
+}
+
 /**
  * 把某楼的一张图跑完整条链,并把状态推到卡片上。
- * 卡片 DOM 已挂载时实时更新;未挂载时只更新记录,下一次 hydrate 读取。
+ * 卡片 DOM 已挂载时实时更新;未挂载时只更新 record,下一次 hydrate 读取。
  */
 export async function generateIntoFloor(
   floor: number,
@@ -94,6 +99,8 @@ export async function generateIntoFloor(
   record.state = 'running';
   record.status = '准备中…';
   records.set(key, record);
+  // 先把卡片容器建出来:即使正文里的占位符还没渲染成 DOM,也要有个挂载点。
+  ensureCardContainer(floor, seq);
   paint(floor, seq, record);
 
   try {
@@ -114,7 +121,8 @@ export async function generateIntoFloor(
     record.state = 'done';
     record.status = '';
     records.set(key, record);
-    paint(floor, seq, record);
+    // 出图成功 → 把图真正插进楼层并重渲染,而不是只改内存里的 record。
+    await commitImageToFloor(floor, record);
     return record;
   } catch (error) {
     const aborted = controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError');
@@ -128,6 +136,53 @@ export async function generateIntoFloor(
   }
 }
 
+/**
+ * 把记录里的图落进楼层。
+ *
+ * 两条铁律(都是实测踩出来的):
+ *
+ * 1. **绝不写 message.mes**。往正文插 `<htj-zz-card>` 会让 ST 整条消息重跑正则,
+ *    用户「状态美化 / 选项美化」的匹配区间被破坏,面板退化成源码。
+ * 2. **绝不调 updateMessageBlock 重渲染**。ST 的整楼重渲染会把正则产出的
+ *    iframe 全部拆掉且不再重建(实测 iframe 3 → 0),状态栏直接消失。
+ *
+ * 所以卡片只活在 DOM 层:直接在 .mes_text 末尾挂一个节点。
+ * 楼层被 ST 重渲染时(切 swipe、编辑等),由 hydrateAll 重新挂回。
+ */
+async function commitImageToFloor(floor: number, record: CardRecord): Promise<void> {
+  // .mes_text 可能正被 ST 替换,给它几个短帧重试;但不触发任何重渲染。
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const holder = ensureCardContainer(floor, 0);
+    if (holder) {
+      renderCardInto(holder, record, floor, 0);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * 保证楼层 DOM 里有一个 .htj-zz-card 挂载点。
+ *
+ * 只在 .mes_text 末尾追加,不依赖正文里存在任何标签——
+ * 因为本扩展不再往 message.mes 里写占位符。
+ */
+function ensureCardContainer(floor: number, seq: number): HTMLElement | null {
+  const mesNode = document.querySelector<HTMLElement>(`#chat .mes[mesid="${floor}"]`);
+  const textNode = mesNode?.querySelector<HTMLElement>('.mes_text');
+  if (!textNode) return null;
+  ensureStyle();
+
+  const existing = textNode.querySelector<HTMLElement>(`.htj-zz-card[data-seq="${seq}"]`);
+  if (existing) return existing;
+
+  const holder = document.createElement('div');
+  holder.className = 'htj-zz-card';
+  holder.dataset.seq = String(seq);
+  textNode.append(holder);
+  return holder;
+}
+
 /** 取消某楼在跑的生成。 */
 export function cancelFloor(floor: number): void {
   const ctx = getContext();
@@ -138,8 +193,10 @@ export function cancelFloor(floor: number): void {
 /* ---------------- DOM ---------------- */
 
 function paint(floor: number, seq: number, record: CardRecord): void {
+  // 注意:按 **class** 找,不按标签名。挂载点是我们自己造的 div.htj-zz-card;
+  // 用标签名 htj-zz-card 会永远匹配不到(已实测踩到,表现为卡片空白无内容)。
   const node = document.querySelector<HTMLElement>(
-    `#chat .mes[mesid="${floor}"] ${TAG_NAME}[data-seq="${seq}"]`,
+    `#chat .mes[mesid="${floor}"] .htj-zz-card[data-seq="${seq}"]`,
   );
   if (node) renderCardInto(node, record, floor, seq);
 }
@@ -225,12 +282,14 @@ function controls(floor: number, seq: number, record: CardRecord): HTMLElement {
   }, running_ || !record.positive);
 
   const remove = button('移除卡片', () => {
+    // 只删 DOM 节点与记录,不碰正文——正文归用户和正则脚本所有
     const ctx = getContext();
-    const message = ctx?.chat?.[floor];
-    if (!message) return;
-    message.mes = message.mes.replace(new RegExp(`<${TAG_NAME}[^>]*seq="${seq}"[\\s\\S]*?</${TAG_NAME}>`, 'i'), '').trimEnd();
-    void ctx.saveChat?.();
-    reloadMessageDom(floor);
+    const key = cardKey(ctx?.getCurrentChatId?.() ?? '', floor, swipeOf(ctx?.chat?.[floor]));
+    records.delete(key);
+    running.get(key)?.abort();
+    document
+      .querySelectorAll<HTMLElement>(`#chat .mes[mesid="${floor}"] .htj-zz-card[data-seq="${seq}"]`)
+      .forEach(node => node.remove());
   });
 
   row.append(regen, cancel, copy, edit, remove);
@@ -296,39 +355,18 @@ function ensureStyle(): void {
 }
 
 /**
- * 把某楼正文里的占位符替换成真实卡片。幂等:已有卡片的楼层重复调用只会刷新内容。
- * ST 每次重渲染消息后都要重新调用一次。
+ * 把内存里的出图记录挂回楼层 DOM。幂等,ST 每次重渲染消息后都要调一次。
+ * 只读 message,绝不写——正文归用户和正则脚本所有。
  */
 export function hydrateFloor(floor: number): void {
   const ctx = getContext();
   const message = ctx?.chat?.[floor];
-  if (!message || typeof message.mes !== 'string') return;
-  if (!new RegExp(`<${TAG_NAME}`, 'i').test(message.mes)) return;
-
-  const selector = `#chat .mes[mesid="${floor}"] .mes_text`;
-  const container = document.querySelector<HTMLElement>(selector);
-  if (!container) return;
-  ensureStyle();
-
+  if (!message) return;
   const key = cardKey(ctx?.getCurrentChatId?.() ?? '', floor, swipeOf(message));
-  const placeholderNodes = container.querySelectorAll(TAG_NAME);
-  placeholderNodes.forEach(node => {
-    const seq = Number(node.getAttribute('data-seq') ?? node.getAttribute('seq') ?? '0') || 0;
-    const record = records.get(key) ?? {
-      positive: '',
-      compiled: '',
-      imageUrl: '',
-      state: 'idle' as CardState,
-      status: '',
-      seed: 0,
-    };
-    if (!records.has(key)) records.set(key, record);
-    node.setAttribute('data-seq', String(seq));
-    const holder = document.createElement('div');
-    holder.className = 'htj-zz-card';
-    node.replaceWith(holder);
-    renderCardInto(holder, record, floor, seq);
-  });
+  const record = records.get(key);
+  if (!record) return;
+  const holder = ensureCardContainer(floor, 0);
+  if (holder) renderCardInto(holder, record, floor, 0);
 }
 
 /** 把全聊天里还带着占位符的楼层都挂一遍。 */

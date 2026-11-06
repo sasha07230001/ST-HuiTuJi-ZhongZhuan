@@ -32,6 +32,10 @@ export function mergeSettings(defaults: unknown, raw: unknown): unknown {
     const value = source[key];
     if (isPlainObject(def)) {
       out[key] = mergeSettings(def, value);
+    } else if (Array.isArray(def)) {
+      // 数组默认值(如 storyScope.tags)必须保持数组类型:
+      // 存档里是脏数据时退回默认,否则会给下游留下一个非数组,每次 .filter 都炸。
+      out[key] = Array.isArray(value) ? value : def;
     } else if (typeof def === 'string') {
       out[key] = typeof value === 'string' ? value : def;
     } else if (typeof def === 'number') {

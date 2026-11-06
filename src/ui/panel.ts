@@ -13,6 +13,7 @@ import { runWorkflow, testComfyConnection } from '@/comfy/api';
 import { getPlaceholders, randomSeed, renderWorkflow } from '@/comfy/workflow';
 import { fetchRelayModels, testRelayConnection } from '@/relay/client';
 import { normalizeRelayUrl } from '@/relay/prompt';
+import { parseStoryScopeTagNames, type StoryScopePick } from '@/relay/storyScope';
 import { runChain, storyForFloor } from '@/relay/orchestrator';
 import { getSettings, isReady, saveSettings } from '@/state/settings';
 import { getContext, isAiStoryMessage } from '@/st/context';
@@ -109,6 +110,11 @@ function buildPanel(): void {
   pageRender = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
   pageChannel = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
   pagePrompt = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
+  // data-page 是 switchTab 唯一的对号依据:漏掉它,三个 page 全被判为「不是当前页」
+  // 而一起藏起来,面板就成了空白(已实测踩到两次)。
+  pageRender.dataset.page = 'render';
+  pageChannel.dataset.page = 'channel';
+  pagePrompt.dataset.page = 'prompt';
 
   statusLine = el('span', { class: 'htj-zz-panel-sub', text: '就绪' });
 
@@ -139,6 +145,9 @@ function buildPanel(): void {
   buildChannelPage();
   buildPromptPage();
   mask = overlay;
+  // 关键:三个 page 初始都藏着,必须立刻把当前页签点亮,
+  // 否则首次打开是一整片空白,要点一下页签才有内容。
+  switchTab(activeTab);
 }
 
 function onKeyDown(event: KeyboardEvent): void {
@@ -562,6 +571,8 @@ let negativeInput: HTMLInputElement;
 let wantNegativeBox: HTMLInputElement;
 let retryInput: HTMLInputElement;
 let autoRunBox: HTMLInputElement;
+let scopeTagsInput: HTMLInputElement;
+let scopePickSelect: HTMLSelectElement;
 let orbShowBox: HTMLInputElement;
 let orbSizeInput: HTMLInputElement;
 let orbOpacityInput: HTMLInputElement;
@@ -589,6 +600,32 @@ function buildPromptPage(): void {
   autoRunBox.addEventListener('change', () => {
     const next = getSettings();
     next.autoRun = autoRunBox.checked;
+    saveSettings(next);
+  });
+
+  // 剧情范围
+  scopeTagsInput = el('input', {
+    class: 'text_pole',
+    type: 'text',
+    placeholder: 'content, story, 正文',
+  }) as HTMLInputElement;
+  scopeTagsInput.addEventListener('change', () => {
+    const next = getSettings();
+    next.storyScope.tags = parseStoryScopeTagNames(scopeTagsInput.value);
+    // 回写规范化后的写法,让用户看到实际生效的标签名
+    scopeTagsInput.value = next.storyScope.tags.join(', ');
+    saveSettings(next);
+  });
+
+  scopePickSelect = el('select', { class: 'text_pole' }) as HTMLSelectElement;
+  scopePickSelect.replaceChildren(
+    el('option', { value: 'last', text: 'last — 最后一个块(推荐)' }) as HTMLOptionElement,
+    el('option', { value: 'first', text: 'first — 第一个块' }) as HTMLOptionElement,
+    el('option', { value: 'all', text: 'all — 所有块拼接' }) as HTMLOptionElement,
+  );
+  scopePickSelect.addEventListener('change', () => {
+    const next = getSettings();
+    next.storyScope.pick = scopePickSelect.value as StoryScopePick;
     saveSettings(next);
   });
 
@@ -648,8 +685,32 @@ function buildPromptPage(): void {
     el(
       'div',
       { class: 'htj-zz-cardbox' },
+      el('h4', { text: '剧情范围' }),
+      el('small', {
+        class: 'htj-zz-hint',
+        text: '只把圈定标签包住的正文当剧情;留空 = 整楼都算。取不到成对标签时自动回退整楼。',
+      }),
+      el('label', { class: 'htj-zz-field' },
+        el('span', { class: 'htj-zz-label', text: '范围标签' }),
+        scopeTagsInput,
+      ),
+      el('small', { class: 'htj-zz-hint', text: '多个标签用逗号分隔,可粘 <content>、content_fox 这类写法。' }),
+      el('div', { class: 'htj-zz-row' },
+        el('label', { class: 'htj-zz-field' },
+          el('span', { class: 'htj-zz-label', text: '同名块取哪个' }),
+          scopePickSelect,
+        ),
+      ),
+    ),
+    el(
+      'div',
+      { class: 'htj-zz-cardbox' },
       el('h4', { text: '行为' }),
-      el('label', { class: 'checkbox_label' }, autoRunBox, el('span', { text: '每生成一楼自动出图' })),
+      el('label', { class: 'checkbox_label' }, autoRunBox, el('span', { text: '每生成一楼自动插图' })),
+      el('small', {
+        class: 'htj-zz-hint',
+        text: 'AI 回复完自动取正文走「中转站 → CLIP → 出图」,图直接挂在楼层里;每楼只自动跑一次。',
+      }),
       el('label', { class: 'checkbox_label' }, orbShowBox, el('span', { text: '显示悬浮球' })),
       el('div', { class: 'htj-zz-row' }, sizeWrap, opacityWrap),
       el('div', { class: 'htj-zz-btns' }, resetOrbBtn),
@@ -666,6 +727,8 @@ function refreshPromptForm(): void {
   wantNegativeBox.checked = s.prompt.wantNegative;
   retryInput.value = String(s.prompt.retryCount);
   autoRunBox.checked = s.autoRun;
+  scopeTagsInput.value = (s.storyScope?.tags ?? []).join(', ');
+  scopePickSelect.value = s.storyScope?.pick ?? 'last';
   orbShowBox.checked = s.orb.show;
   orbSizeInput.value = String(s.orb.size);
   orbOpacityInput.value = String(s.orb.opacity);

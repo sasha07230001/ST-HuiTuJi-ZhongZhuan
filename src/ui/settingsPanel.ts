@@ -9,6 +9,7 @@ import { testComfyConnection } from '@/comfy/api';
 import { getPlaceholders, WorkflowError } from '@/comfy/workflow';
 import { fetchRelayModels, testRelayConnection } from '@/relay/client';
 import { normalizeRelayUrl } from '@/relay/prompt';
+import { parseStoryScopeTagNames, type StoryScopePick } from '@/relay/storyScope';
 import { getSettings, saveSettings } from '@/state/settings';
 import { BUILTIN_WORKFLOW, DEFAULT_SETTINGS, type Settings } from '@/types';
 import { el, toast } from '@/ui/dom';
@@ -219,6 +220,23 @@ function buildPanel(): HTMLElement {
     toast('悬浮球已回到默认位置', 'success');
   });
 
+  /* ---- 剧情范围 ---- */
+  const scopeTags = textInput((s.storyScope?.tags ?? []).join(', '), 'content, story, 正文');
+  scopeTags.addEventListener('change', () => {
+    write(next => (next.storyScope.tags = parseStoryScopeTagNames(scopeTags.value)));
+    scopeTags.value = (getSettings().storyScope.tags ?? []).join(', ');
+  });
+  const scopePick = el('select', { class: 'text_pole' });
+  scopePick.replaceChildren(
+    el('option', { value: 'last', text: 'last — 最后一个块(推荐)' }),
+    el('option', { value: 'first', text: 'first — 第一个块' }),
+    el('option', { value: 'all', text: 'all — 所有块拼接' }),
+  );
+  scopePick.value = s.storyScope?.pick ?? 'last';
+  scopePick.addEventListener('change', () => {
+    write(next => (next.storyScope.pick = scopePick.value as StoryScopePick));
+  });
+
   return el(
     'div',
     { class: 'inline-drawer' },
@@ -278,6 +296,16 @@ function buildPanel(): HTMLElement {
         el('label', { class: 'checkbox_label' }, wantNegative, el('span', { text: '让模型额外输出负面词' })),
         field('失败重试次数', retryInput),
         resetPrompt,
+      ),
+
+      el(
+        'fieldset',
+        {},
+        el('legend', { text: '剧情范围 / 自动插图' }),
+        el('small', { class: 'htj-zz-hint', text: '只把圈定标签包住的正文当剧情;留空 = 整楼都算,取不到时自动回退。' }),
+        field('范围标签(逗号分隔)', scopeTags),
+        field('同名块取哪个', scopePick),
+        el('label', { class: 'checkbox_label' }, autoRun, el('span', { text: '每生成一楼自动插图' })),
       ),
 
       el(

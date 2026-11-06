@@ -57,6 +57,19 @@ export interface PromptSettings {
   retryCount: number;
 }
 
+/**
+ * 剧情范围设置(移植自二号的 autoTag/storyScope)。
+ *
+ * 模型常在正文外写思维链、状态栏、格式示例,那些字不当剧情。
+ * 配了标签就只取 `<标签>…</标签>` 里的内容;取不到时回退整楼。
+ */
+export interface StoryScopeSettings {
+  /** 范围标签名(已解析过,不含尖括号)。空数组 = 不启用。 */
+  tags: string[];
+  /** 同名块取哪个:last=最后一个(默认)、first、all=全部拼接。 */
+  pick: import('@/relay/storyScope').StoryScopePick;
+}
+
 /** 扩展总设置。 */
 export interface Settings {
   /** 总开关。 */
@@ -68,6 +81,8 @@ export interface Settings {
   prompt: PromptSettings;
   /** 悬浮球配置。位置这类纯视觉态走 localStorage,这里只放需要跨设备同步的开关。 */
   orb: OrbSettings;
+  /** 剧情范围(哪些正文算剧情)。 */
+  storyScope: StoryScopeSettings;
 }
 
 export interface OrbSettings {
@@ -126,6 +141,10 @@ export const DEFAULT_SETTINGS: Settings = {
     show: true,
     size: 48,
     opacity: 0.62,
+  },
+  storyScope: {
+    tags: [],
+    pick: 'last',
   },
 };
 

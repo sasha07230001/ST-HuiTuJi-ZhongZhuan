@@ -27,19 +27,41 @@ interface OrbPos {
   y: number;
 }
 
+/** 默认位置:右侧贴边、纵向偏下。 */
+function defaultPos(): OrbPos {
+  return { dock: 'right', x: 0, y: Math.round((viewport()?.innerHeight || 800) * 0.6) };
+}
+
+/**
+ * 读位置并**修掉不一致的存档**。
+ *
+ * 实测踩到的坑:存档里 `dock: 'none'`(自由状态)但坐标恰好落在屏幕右缘外,
+ * 贴边模式下会把它夹回视口,自由模式下却按原坐标渲染 —— 结果球一半在屏幕外。
+ * 读出来先按当前视口归一化,再判断该贴边还是自由。
+ */
 function loadPos(): OrbPos {
+  const vw = viewport()?.innerWidth || 0;
+  const s = size();
+  let pos = defaultPos();
   try {
     const raw = localStorage.getItem(POS_KEY);
     if (raw) {
       const p = JSON.parse(raw) as Partial<OrbPos>;
       if (p && (p.dock === 'left' || p.dock === 'right' || p.dock === 'none')) {
-        return { dock: p.dock, x: Number(p.x) || 0, y: Number(p.y) || 0 };
+        pos = { dock: p.dock, x: Number(p.x) || 0, y: Number(p.y) || 0 };
       }
     }
   } catch {
     /* 无 localStorage 时用默认值 */
   }
-  return { dock: 'right', x: 0, y: Math.round((viewport()?.innerHeight || 800) * 0.6) };
+
+  // 自由态的坐标夹进可视区;夹完仍贴边就转成贴边态,免得浮出一半。
+  if (pos.dock === 'none' && vw > 0) {
+    pos.x = Math.min(Math.max(0, pos.x), Math.max(0, vw - s));
+    if (pos.x + s >= vw - SNAP_ZONE) pos = { ...pos, dock: 'right' };
+    else if (pos.x <= SNAP_ZONE) pos = { ...pos, dock: 'left' };
+  }
+  return pos;
 }
 
 function savePos(pos: OrbPos): void {
@@ -104,21 +126,26 @@ function applyStyle(): void {
   orbEl.style.width = `${s}px`;
   orbEl.style.height = `${s}px`;
   orbEl.style.top = `${pos.y}px`;
-  orbEl.style.left = '';
-  orbEl.style.right = '';
   orbEl.style.opacity = String(opacity);
+  // 不要在这里 style.left = '' / style.right = ''「清零」:空串只会删掉内联值,
+  // 计算值会退回上一个有效值(实测 left 顽固停在 1392px)。
+  // 两侧的互斥一律交给下面的分支写死 px / auto。
 
   const out = dragging || awake;
-  if (pos.dock === 'left') {
-    orbEl.style.left = '0px';
-    orbEl.style.transform = out ? 'translateX(0)' : 'translateX(-58%)';
-  } else if (pos.dock === 'right') {
-    orbEl.style.right = '0px';
-    orbEl.style.transform = out ? 'translateX(0)' : 'translateX(58%)';
-  } else {
-    orbEl.style.left = `${pos.x}px`;
-    orbEl.style.transform = 'translateX(0)';
-  }
+  // 贴边态故意错开自己的一半做「半隐」;free 态必须整颗落在视口内。
+  const tuck = Math.round(s * 0.58);
+  const vw = viewport()?.innerWidth || 0;
+
+  // 定位一律 left + translateX,并且把「半隐位移」包含进 left 里算。
+  //
+  // 实测踩到的坑:页面被二号(bbi-app-host)撑出横向溢出(scrollWidth 1461 > 1440),
+  // 于是 `right:0` 贴的是**被撑大的文档右边**,球直接落到视口外(x=1420,视口 1440)。
+  // 用 left 锚定视口左缘、把右对齐自己算出来,就不再受别人撑宽文档影响。
+  const anchor = pos.dock === 'left' ? 0 : pos.dock === 'right' ? Math.max(0, vw - s) : Math.min(Math.max(0, pos.x), Math.max(0, vw - s));
+  const shift = out ? 0 : pos.dock === 'left' ? -tuck : pos.dock === 'right' ? tuck : 0;
+  orbEl.style.left = `${anchor}px`;
+  orbEl.style.right = 'auto';
+  orbEl.style.transform = shift ? `translateX(${shift}px)` : 'translateX(0)';
 }
 
 /* ---------------- 拖动 ---------------- */

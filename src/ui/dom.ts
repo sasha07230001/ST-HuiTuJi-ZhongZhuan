@@ -53,7 +53,7 @@ export function toast(message: string, kind: 'info' | 'success' | 'warning' | 'e
 export const UI_CSS = `
 .htj-zz-orb {
   position: fixed;
-  z-index: 9000;
+  z-index: 2147483000;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -66,6 +66,7 @@ export const UI_CSS = `
   box-shadow: 0 6px 18px rgba(124, 92, 255, .42), inset 0 1px 0 rgba(255, 255, 255, .35);
   transition: transform .18s ease, opacity .18s ease, box-shadow .18s ease;
   font-size: 0;
+  pointer-events: auto;
 }
 .htj-zz-orb:hover,
 .htj-zz-orb:focus-visible,
@@ -91,7 +92,7 @@ export const UI_CSS = `
 .htj-zz-panel-mask {
   position: fixed;
   inset: 0;
-  z-index: 9500;
+  z-index: 2147483001;
   background: rgba(8, 8, 14, .55);
   backdrop-filter: blur(2px);
   display: flex;

@@ -18,6 +18,7 @@ import {
   joinPositive,
   renderSystemPrompt,
 } from '@/relay/prompt';
+import { extractStoryScope } from '@/relay/storyScope';
 import { getSettings } from '@/state/settings';
 import { getContext, isAiStoryMessage } from '@/st/context';
 import type { ClipPrompt, Settings } from '@/types';
@@ -114,17 +115,34 @@ export async function runChain(input: RunInput): Promise<RunOutput> {
   const status = (text: string) => input.onStatus?.(text);
 
   // ① 拿正文
-  let story = (input.story ?? '').trim();
-  if (story) {
-    story = cleanStoryText(story);
-  } else {
+  let rawStory = (input.story ?? '').trim();
+  if (!rawStory) {
     const picked = storyForFloor(input.floor);
     if (!picked.ok) throw new Error(picked.reason);
-    story = picked.text;
+    // 注意:storyForFloor 已做 cleanStoryText,但范围必须在**清洗前**的原文上取,
+    // 因为 cleanStoryText 会剥掉标签,之后就再也找不到块了。
+    const ctx = getContext();
+    const message = ctx?.chat?.[input.floor];
+    rawStory = String(message?.mes ?? picked.text);
   }
+
+  // ② 剧情范围:只把圈定标签里的内容当剧情;取不到就回退整楼
+  const scopeTags = s.storyScope?.tags ?? [];
+  let scoped: string | null = null;
+  if (scopeTags.length) {
+    const scope = extractStoryScope(rawStory, scopeTags, s.storyScope.pick);
+    scoped = scope.text;
+    if (scoped) {
+      status(`已按剧情范围取得 ${scoped.length} 字`);
+    } else {
+      console.info(`[绘图姬·中转站] 剧情范围未生效(${scope.reason}),按整楼处理`);
+    }
+  }
+
+  const story = cleanStoryText(scoped ?? rawStory);
   if (!story) throw new Error('正文是空的,没有可编译的内容');
 
-  // ② 中转站编译
+  // ③ 中转站编译
   status('正在交给中转站编译提示词…');
   const messages = buildMessages(s, story, input.note ?? '');
   let compiled = '';
