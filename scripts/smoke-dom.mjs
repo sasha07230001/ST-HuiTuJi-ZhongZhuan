@@ -134,7 +134,8 @@ if (orb) {
 await new Promise((r) => setTimeout(r, 50));
 const mask = window.document.getElementById('htj-zz-panel-mask');
 check('点击悬浮球打开面板', !!mask && mask.style.display !== 'none');
-check('面板有三个页签', (mask?.querySelectorAll('.htj-zz-tab').length ?? 0) === 3);
+const tabCount = mask?.querySelectorAll('.htj-zz-tab').length ?? 0;
+check(`面板有四个页签(出图/渠道/角色档案/提示词),实得 `, tabCount === 4);
 check('出图页可见', !!mask?.querySelector('.htj-zz-page[data-page="render"], .htj-zz-page'));
 check('面板打开时悬浮球被隐藏', orb?.style.display === 'none');
 

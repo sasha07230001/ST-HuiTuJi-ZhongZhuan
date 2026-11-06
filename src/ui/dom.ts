@@ -172,8 +172,36 @@ export const UI_CSS = `
 .htj-zz-canvas-empty { opacity: .45; font-size: 13px; text-align: center; line-height: 1.7; }
 .htj-zz-promptbox { display: flex; flex-direction: column; gap: 8px; }
 .htj-zz-promptbox textarea { min-height: 84px; font-size: 12px; }
-.htj-zz-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.htj-zz-btns { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.htj-zz-btns .menu_button { white-space: nowrap; flex: 0 0 auto; }
+.htj-zz-charrow .htj-zz-btns { flex-wrap: nowrap; }
 .htj-zz-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: rgba(124,92,255,.25); }
+.htj-zz-charlist { display: flex; flex-direction: column; gap: 8px; }
+.htj-zz-charrow {
+  display: flex; gap: 10px; align-items: flex-start; justify-content: space-between;
+  padding: 10px;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.1));
+  border-radius: 8px;
+  background: rgba(255,255,255,.02);
+}
+.htj-zz-charrow-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
+.htj-zz-charrow-main .htj-zz-hint { word-break: break-word; }
+.htj-zz-charrow-main .htj-zz-hint:first-of-type {
+  /* 外貌摘要可能是一大段 tag,截到几行了事,点开编辑再看全 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.htj-zz-chareditor {
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.14));
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 14px;
+  background: rgba(124,92,255,.06);
+}
+.htj-zz-chareditor h5 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+.htj-zz-importrow { display: flex; align-items: baseline; gap: 6px; padding: 4px 0; }
 @media (max-width: 640px) {
   .htj-zz-panel-mask { padding: 0; }
   .htj-zz-panel { width: 100%; height: 100%; border-radius: 0; }

@@ -19,13 +19,14 @@ import { getSettings, isReady, saveSettings } from '@/state/settings';
 import { getContext, isAiStoryMessage } from '@/st/context';
 import { BUILTIN_WORKFLOW, DEFAULT_SETTINGS } from '@/types';
 import { generateIntoFloor } from '@/ui/card';
+import { buildCharsPage } from '@/ui/charsPage';
 import { UI_CSS, el, ensureStyle, toast } from '@/ui/dom';
 import { hideOrbForPanel, resetOrbPosition, syncOrb } from '@/ui/orb';
 
 const MASK_ID = 'htj-zz-panel-mask';
 const TITLE = '绘图姬·中转站';
 
-type TabId = 'render' | 'channel' | 'prompt';
+type TabId = 'render' | 'channel' | 'chars' | 'prompt';
 
 let mask: HTMLDivElement | null = null;
 let activeTab: TabId = 'render';
@@ -79,6 +80,7 @@ function switchTab(tab: TabId): void {
 
 let pageRender: HTMLDivElement;
 let pageChannel: HTMLDivElement;
+let pageChars: HTMLDivElement;
 let pagePrompt: HTMLDivElement;
 let statusLine: HTMLElement;
 
@@ -93,6 +95,7 @@ function buildPanel(): void {
   const tabDefs: Array<[TabId, string]> = [
     ['render', '出图'],
     ['channel', '渠道'],
+    ['chars', '角色档案'],
     ['prompt', '提示词'],
   ];
   for (const [id, label] of tabDefs) {
@@ -103,17 +106,20 @@ function buildPanel(): void {
       if (id === 'channel') refreshChannelForm();
       if (id === 'prompt') refreshPromptForm();
       if (id === 'render') refreshFloorSelect();
+      if (id === 'chars') rebuildCharsPage();
     });
     tabs.append(btn);
   }
 
   pageRender = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
   pageChannel = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
+  pageChars = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
   pagePrompt = el('div', { class: 'htj-zz-page' }) as HTMLDivElement;
-  // data-page 是 switchTab 唯一的对号依据:漏掉它,三个 page 全被判为「不是当前页」
+  // data-page 是 switchTab 唯一的对号依据:漏掉它,page 全被判为「不是当前页」
   // 而一起藏起来,面板就成了空白(已实测踩到两次)。
   pageRender.dataset.page = 'render';
   pageChannel.dataset.page = 'channel';
+  pageChars.dataset.page = 'chars';
   pagePrompt.dataset.page = 'prompt';
 
   statusLine = el('span', { class: 'htj-zz-panel-sub', text: '就绪' });
@@ -130,7 +136,7 @@ function buildPanel(): void {
       closeBtn,
     ),
     tabs,
-    el('div', { class: 'htj-zz-panel-body' }, pageRender, pageChannel, pagePrompt),
+    el('div', { class: 'htj-zz-panel-body' }, pageRender, pageChannel, pageChars, pagePrompt),
     el('div', { class: 'htj-zz-panel-foot' }, statusLine),
   );
 
@@ -144,10 +150,21 @@ function buildPanel(): void {
   buildRenderPage();
   buildChannelPage();
   buildPromptPage();
+  buildCharsPageInto();
   mask = overlay;
-  // 关键:三个 page 初始都藏着,必须立刻把当前页签点亮,
+  // 关键:所有 page 初始都藏着,必须立刻把当前页签点亮,
   // 否则首次打开是一整片空白,要点一下页签才有内容。
   switchTab(activeTab);
+}
+
+/** 角色档案页:每次切过去重建,保证列表是库里最新的。 */
+function buildCharsPageInto(): void {
+  pageChars.replaceChildren(buildCharsPage(() => rebuildCharsPage()));
+}
+
+function rebuildCharsPage(): void {
+  if (!pageChars) return;
+  pageChars.replaceChildren(buildCharsPage(() => rebuildCharsPage()));
 }
 
 function onKeyDown(event: KeyboardEvent): void {

@@ -33,8 +33,9 @@ export function mergeSettings(defaults: unknown, raw: unknown): unknown {
     if (isPlainObject(def)) {
       out[key] = mergeSettings(def, value);
     } else if (Array.isArray(def)) {
-      // 数组默认值(如 storyScope.tags)必须保持数组类型:
-      // 存档里是脏数据时退回默认,否则会给下游留下一个非数组,每次 .filter 都炸。
+      // 数组默认值必须保持数组类型。默认非空(如角色库)时保留存档内容,
+      // 默认为空(如 storyScope.tags)时同样接受存档数组——两种情况都不能
+      // 把非数组的脏数据漏给下游,否则 .filter / .join 会炸。
       out[key] = Array.isArray(value) ? value : def;
     } else if (typeof def === 'string') {
       out[key] = typeof value === 'string' ? value : def;

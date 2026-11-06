@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 「正文 → 中转站 → CLIP → 出图」那条链的唯一实现。
  *
  * 楼层卡片、楼层按钮、自动流程都走这一个函数,不各自复制一份。
@@ -12,6 +12,14 @@
 import { runWorkflow } from '@/comfy/api';
 import { randomSeed, renderWorkflow, WorkflowError } from '@/comfy/workflow';
 import { compilePrompt, RelayError, type ChatMsg } from '@/relay/client';
+import { detectCastAndChanges } from '@/chars/archive';
+import {
+  charactersInText,
+  findEntry,
+  mergeCharacterPrompts,
+  type CharEntry,
+} from '@/chars/profile';
+import { emitChanges } from '@/chars/store';
 import {
   cleanStoryText,
   joinNegative,
@@ -178,8 +186,37 @@ export async function runChain(input: RunInput): Promise<RunOutput> {
 
   // ③ 合并恒定画风/负面
   const split = splitPosNeg(compiled);
-  const positive = joinPositive(split.positive || compiled, s.prompt.styleSuffix);
+  let positive = joinPositive(split.positive || compiled, s.prompt.styleSuffix);
   const negative = joinNegative(split.negative, s.prompt.negative);
+
+  // ③.5 角色档案:把在场角色的固定外貌拼进提示词
+  //
+  // 为什么不能只靠字符串匹配:剧情大量用「她/他/妈妈」指代,名字根本不出现。
+  // 所以让模型在自动建档那一步顺带给出 cast;匹配只作为兜底(模型没给时)。
+  if (s.chars?.autoMerge !== false && (s.chars?.entries?.length ?? 0) > 0) {
+    status('正在匹配在场角色…');
+    const library = s.chars.entries;
+    let cast: string[] = [];
+
+    if (s.chars?.autoArchive !== false) {
+      const detected = await detectCastAndChanges(story, library, input.signal);
+      cast = detected.cast;
+      if (detected.changes.length) {
+        emitChanges(detected.changes);
+        status(`已更新 ${detected.changes.length} 条角色档案`);
+      }
+    }
+
+    // 模型给的 cast 优先;没给就用正文里出现的名字兜底
+    const present = cast.length
+      ? cast.map(name => findEntry(library, name)).filter((e): e is CharEntry => !!e)
+      : charactersInText(story, library);
+
+    if (present.length) {
+      positive = mergeCharacterPrompts(positive, present);
+      status(`已拼入 ${present.length} 个角色的外貌`);
+    }
+  }
 
   // ④ 渲染工作流并出图
   status('提示词已就绪,正在提交 ComfyUI…');

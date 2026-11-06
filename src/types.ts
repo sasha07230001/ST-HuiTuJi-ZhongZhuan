@@ -70,6 +70,16 @@ export interface StoryScopeSettings {
   pick: import('@/relay/storyScope').StoryScopePick;
 }
 
+/** 角色档案设置。 */
+export interface CharSettings {
+  /** 角色库。 */
+  entries: import('@/chars/profile').CharEntry[];
+  /** 出图时自动把在场角色外貌拼进提示词。 */
+  autoMerge: boolean;
+  /** 允许中转站模型从剧情里自动建档。 */
+  autoArchive: boolean;
+}
+
 /** 扩展总设置。 */
 export interface Settings {
   /** 总开关。 */
@@ -83,6 +93,8 @@ export interface Settings {
   orb: OrbSettings;
   /** 剧情范围(哪些正文算剧情)。 */
   storyScope: StoryScopeSettings;
+  /** 角色档案。 */
+  chars: CharSettings;
 }
 
 export interface OrbSettings {
@@ -145,6 +157,11 @@ export const DEFAULT_SETTINGS: Settings = {
   storyScope: {
     tags: [],
     pick: 'last',
+  },
+  chars: {
+    entries: [],
+    autoMerge: true,
+    autoArchive: true,
   },
 };
 
