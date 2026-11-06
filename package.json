@@ -1,0 +1,34 @@
+{
+  "name": "st-hui-tu-ji-zhong-zhuan",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "绘图姬·中转站：SillyTavern 扩展，把剧情正文先交给中转站模型编译成 ComfyUI CLIP 提示词，再送进 ComfyUI 出图",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sasha07230001/ST-HuiTuJi-ZhongZhuan"
+  },
+  "keywords": [
+    "sillytavern",
+    "sillytavern-extension",
+    "comfyui",
+    "image-generation",
+    "prompt-engineering",
+    "llm"
+  ],
+  "scripts": {
+    "sync-version": "node scripts/sync-version.mjs",
+    "prebuild": "node scripts/sync-version.mjs",
+    "build": "vite build",
+    "prewatch": "node scripts/sync-version.mjs",
+    "watch": "vite build --watch --mode development",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vite": "^7.3.3",
+    "vitest": "^4.1.10"
+  }
+}

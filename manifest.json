@@ -1,0 +1,12 @@
+{
+  "display_name": "绘图姬·中转站",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "dist/index.js?ver=0.1.0",
+  "author": "sasha07230001",
+  "version": "0.1.0",
+  "homePage": "https://github.com/sasha07230001/ST-HuiTuJi-ZhongZhuan",
+  "auto_update": false,
+  "minimum_client_version": "1.12.13"
+}
