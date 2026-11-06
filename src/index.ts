@@ -81,12 +81,19 @@ function addTopBarButton(): void {
 
 /**
  * 加载顺序:扩展脚本可能在 ST 的 getContext 就绪之前执行,
- * 所以先等宿主,再分阶段挂载;每块独立 try,一块挂了不影响其它块。
+ * 也可能在 DOMContentLoaded 之前执行。这里用原生事件,**不依赖 jQuery**——
+ * bundle 把 jquery 标成 external 映射到全局 $,加载顺序一旦不对就是
+ * ReferenceError,整个扩展初始化会当场断掉(实测踩到过)。
  */
 async function boot(): Promise<void> {
   info(`v${VERSION} 正在加载…`);
 
-  $(() => {
+  const onReady = (fn: () => void) => {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true });
+    else fn();
+  };
+
+  onReady(() => {
     try {
       mountSettingsPanel();
     } catch (error) {
@@ -103,7 +110,7 @@ async function boot(): Promise<void> {
   try {
     mountSettingsPanel();
   } catch {
-    /* $(() => {}) 里已兜过一次 */
+    /* onReady 里已兜过一次 */
   }
 
   try {

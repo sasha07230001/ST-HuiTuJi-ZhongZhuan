@@ -24,9 +24,11 @@
     "prewatch": "node scripts/sync-version.mjs",
     "watch": "vite build --watch --mode development",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "node scripts/smoke-dom.mjs"
   },
   "devDependencies": {
+    "jsdom": "^27.0.0",
     "typescript": "^5.7.0",
     "vite": "^7.3.3",
     "vitest": "^4.1.10"
