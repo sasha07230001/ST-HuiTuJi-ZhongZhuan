@@ -14,6 +14,17 @@ import {
   type CharEntry,
   type CharField,
 } from '@/chars/profile';
+import {
+  emptyTransient,
+  findTransient,
+  migrateForFloor,
+  normalizeTransients,
+  removeTransient,
+  transientToTags,
+  upsertTransient,
+  type TransientPatch,
+  type TransientProfile,
+} from '@/chars/transient';
 import type { CharChange } from '@/chars/archive';
 import { getSettings, saveSettings } from '@/state/settings';
 
@@ -108,4 +119,103 @@ export function setChangeSink(sink: (changes: CharChange[]) => void): void {
 export function emitChanges(changes: CharChange[]): void {
   if (changeSink) changeSink(changes);
   else applyChanges(changes);
+}
+
+/* ---------------- 临时档案 ---------------- */
+
+/** 读临时档案(实时的)。 */
+export function getTransients(): TransientProfile[] {
+  const s = getSettings();
+  return normalizeTransients(s.chars?.transients ?? []);
+}
+
+export function setTransients(list: TransientProfile[]): void {
+  const next = getSettings();
+  next.chars.transients = normalizeTransients(list);
+  saveSettings(next);
+}
+
+/** 某一楼当前生效的临时档案:按聊天/楼层迁移后再读。 */
+export function transientsForRun(chatId: string, floor: number): TransientProfile[] {
+  const s = getSettings();
+  const list = normalizeTransients(s.chars?.transients ?? []);
+  if (s.chars?.transient?.resetOnChatChange === false) return list;
+  const migrated = migrateForFloor(list, chatId, floor);
+  if (migrated.changed) setTransients(migrated.list);
+  return migrated.list;
+}
+
+/** 写入一条临时档案;返回是否真的有内容变化。 */
+export function saveTransient(
+  patch: TransientPatch,
+  opts: { chatId?: string; floor?: number } = {},
+): { changed: boolean; profile: TransientProfile } {
+  const result = upsertTransient(getTransients(), patch, opts);
+  if (result.changed) setTransients(result.list);
+  return { changed: result.changed, profile: result.profile };
+}
+
+/** 手动清空某个角色的临时档案(回到固定档案)。 */
+export function clearTransient(name: string): void {
+  setTransients(removeTransient(getTransients(), name));
+}
+
+/** 全部清空。 */
+export function clearAllTransients(): void {
+  setTransients([]);
+}
+
+/**
+ * 把模型读到的变化写回临时档案。
+ *
+ * 口径:
+ * - 冻结的条目跳过(用户手改过,AI 不许覆盖);
+ * - raw 非空 → 整串替换;
+ * - raw 空但 reason 非空 → 剧情说「脱光了」这类清空,把临时档案整体清掉
+ *   (不是写空串留下来,留着空壳会让下次判断混乱)。
+ */
+export function applyTransientChanges(
+  changes: Array<{ name: string; raw: string; reason: string }>,
+  opts: { chatId?: string; floor?: number; onlyKnown?: boolean; knownNames?: string[] } = {},
+): { updated: number; cleared: number; skipped: number } {
+  let updated = 0;
+  let cleared = 0;
+  let skipped = 0;
+  const known = new Set((opts.knownNames ?? []).map(n => n.toLowerCase()));
+
+  for (const change of changes) {
+    const name = String(change.name ?? '').trim();
+    if (!name) continue;
+    if (opts.onlyKnown && known.size && !known.has(name.toLowerCase())) {
+      skipped += 1;
+      continue;
+    }
+    const existing = findTransient(getTransients(), name);
+    if (existing?.frozen) {
+      skipped += 1;
+      continue;
+    }
+    const raw = String(change.raw ?? '').trim();
+    if (!raw) {
+      // 剧情明确说「什么都不剩了」:清空这一层,回到固定档案
+      if (existing) {
+        clearTransient(name);
+        cleared += 1;
+      }
+      continue;
+    }
+    const result = saveTransient({ name, raw, replace: true }, opts);
+    if (result.changed) updated += 1;
+  }
+  return { updated, cleared, skipped };
+}
+
+/** 给 UI:某角色的临时档案摘要。 */
+export function transientSummary(name: string): string {
+  return transientToTags(findTransient(getTransients(), name));
+}
+
+/** 空占位,给编辑器新建用。 */
+export function blankTransient(name: string, chatId = '', floor = 0): TransientProfile {
+  return emptyTransient(name, chatId, floor);
 }

@@ -80,3 +80,56 @@ export function configProblems(s: Settings = getSettings()): string[] {
 export function isReady(s: Settings = getSettings()): boolean {
   return configProblems(s).length === 0;
 }
+
+/**
+ * 换设备 / 浏览器不同源时,`extension_settings` 里**看不到**别处配过的 key。
+ *
+ * 自动插图以前是硬门槛 `isReady()`,于是手机上(或换了浏览器)明明勾了「自动插图」,
+ * 却只弹一句「配置不齐」再也不动。这里多认一条**兜底**:中转站地址 + 模型 + 至少一个
+ * 密钥来源(本项目 key,或设置里其它 OpenAI 兼容渠道的 key),就算「能用」——
+ * 请求经 ST 服务端转发,服务端会用自己那份 key 去补。
+ *
+ * 注意:手动按钮永远不受这个门槛限制,点了就跑,错了给错误信息。
+ */
+export function isProbablyReady(): boolean {
+  const s = getSettings();
+  if (isReady(s)) return true;
+  const hasRelay = !!s.relay.url.trim() && !!s.relay.model.trim();
+  const hasComfy = !!s.comfy.url.trim() && !!s.comfy.workflow.trim();
+  if (!hasRelay || !hasComfy) return false;
+  if (s.relay.key.trim()) return true;
+  // ST 自己的 settings 里任意一个 OpenAI 兼容渠道有 key,后端转发就能用上
+  const serverKey = getServerFallbackKey();
+  return !!serverKey;
+}
+
+/**
+ * ST 可能把「自定义 OpenAI 兼容端点」存在其它几个键下(不同版本不同名)。
+ * 这里按已知的几个键找一个非空字符串当兜底,找不到返回空串。只读,不写。
+ */
+export function getServerFallbackKey(): string {
+  const ctx = getContext();
+  const settings = ctx?.extensionSettings ?? {};
+  const candidates: Array<[string, string]> = [
+    ['openai', 'reverse_proxy_password'],
+    ['openai', 'proxy_password'],
+    ['custom', 'proxy_password'],
+    ['custom', 'reverse_proxy_password'],
+  ];
+  for (const [group, field] of candidates) {
+    const box = settings[group];
+    if (!box || typeof box !== 'object') continue;
+    const value = (box as Record<string, unknown>)[field];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  // 最后再看一眼本扩展自己的 key(调用方已经判过一次,这里只是让函数自洽)
+  const own = settings[SETTINGS_KEY];
+  if (own && typeof own === 'object') {
+    const relay = (own as Record<string, unknown>).relay;
+    if (relay && typeof relay === 'object') {
+      const key = (relay as Record<string, unknown>).key;
+      if (typeof key === 'string' && key.trim()) return key.trim();
+    }
+  }
+  return '';
+}

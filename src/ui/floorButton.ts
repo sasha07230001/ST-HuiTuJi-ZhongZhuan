@@ -6,7 +6,7 @@
  */
 
 import { getContext, isAiStoryMessage } from '@/st/context';
-import { generateIntoFloor } from '@/ui/card';
+import { illustrateFloor } from '@/ui/card';
 
 const BUTTON_CLASS = 'htj-zz-floor-btn';
 const WRAP_CLASS = 'htj-zz-floor-actions';
@@ -57,7 +57,11 @@ async function trigger(floor: number, btn: HTMLButtonElement): Promise<void> {
   }
   btn.disabled = true;
   try {
-    await generateIntoFloor(floor);
+    const result = await illustrateFloor(floor);
+    if (result.errors.length) {
+      const toastr = (window as unknown as { toastr?: { error?: (m: string, t: string) => void } }).toastr;
+      toastr?.error?.(result.errors[0], '绘图姬·中转站');
+    }
   } finally {
     btn.disabled = false;
   }

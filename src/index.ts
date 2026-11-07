@@ -7,18 +7,21 @@
  *   剧情正文 ──► 中转站(OpenAI 兼容 url+key) ──► CLIP 提示词 ──► ComfyUI ──► 楼层卡片
  */
 
-import { getSettings, isReady } from '@/state/settings';
+import { getSettings, configProblems, isProbablyReady } from '@/state/settings';
 import { getContext, waitForContext } from '@/st/context';
-import { bindAutoIllustrate } from '@/ui/autoIllustrate';
-import { generateIntoFloor, hydrateAll, hasLegacyPlaceholder, stripCardPlaceholders } from '@/ui/card';
+import { autoIllustrateState, bindAutoIllustrate } from '@/ui/autoIllustrate';
+import { hydrateAll, hasLegacyPlaceholder, illustrateFloor, resetFloorCards, stripCardPlaceholders } from '@/ui/card';
 import { bindFloorButtons, decorateAllFloors } from '@/ui/floorButton';
-import { syncOrb } from '@/ui/orb';
-import { togglePanel } from '@/ui/panel';
+import { setOrbBusy, syncOrb } from '@/ui/orb';
+import { noteAutoRunDone, togglePanel } from '@/ui/panel';
 import { mountSettingsPanel, TITLE } from '@/ui/settingsPanel';
 
 declare const __HTJ_ZZ_VERSION__: string;
 
 const VERSION = typeof __HTJ_ZZ_VERSION__ === 'string' ? __HTJ_ZZ_VERSION__ : 'dev';
+
+/** 上一次提示过的「配置不齐」内容,避免每次生成都弹一遍。 */
+let notReadyWarned = '';
 
 function info(message: string): void {
   console.log(`[${TITLE}] ${message}`);
@@ -133,7 +136,25 @@ async function boot(): Promise<void> {
         const s = getSettings();
         return s.enabled && s.autoRun;
       },
-      ready: () => isReady(),
+      // 用 isProbablyReady 而不是 isReady:换设备/换浏览器后 extension_settings 里
+      // 没有 key 也照样自动跑(请求经 ST 服务端转发,服务端有 key 就行),
+      // 以前这里判死,手机上勾了自动插图也永远不动。
+      ready: () => isProbablyReady(),
+      onNotReady: problems => {
+        // 每次生成都会走到这里,所以只在内容变化时提示一次(不刷屏)
+        const key = problems.join('|');
+        if (notReadyWarned === key) return;
+        notReadyWarned = key;
+        const toastr = (window as unknown as { toastr?: Record<string, (m: string, t: string) => void> }).toastr;
+        toastr?.warning?.(`自动插图已开启但配置不齐:${problems.join('、')}`, TITLE);
+        console.warn(`[${TITLE}] 自动插图配置不齐:${problems.join('、')}`);
+      },
+      onBusy: busy => setOrbBusy(busy),
+      onDone: info => {
+        // 自动流程跑完:面板开着就更新状态行,图库页顺手刷新
+        noteAutoRunDone(info);
+        decorateAllFloors();
+      },
     });
   } catch (error) {
     console.error(`[${TITLE}] 自动插图绑定失败`, error);
@@ -154,18 +175,39 @@ async function boot(): Promise<void> {
 
   const events = ctx.eventTypes ?? ctx.event_types;
   if (events) {
+    // 注意:CHARACTER_MESSAGE_RENDERED 这里**只补水合**,不在这里做出图决策。
+    // 自动出图的闸门/兜底全部由 autoIllustrate 负责,两处都挂会重复触发。
     ctx.eventSource.on(events.CHARACTER_MESSAGE_RENDERED, (messageId: unknown) => {
       const floor = Number(messageId);
       if (Number.isInteger(floor) && floor >= 0) {
         setTimeout(() => {
-          hydrateAll();
+          void hydrateAll();
           decorateAllFloors();
         }, 50);
       }
     });
+    // 切 swipe / 编辑楼层:DOM 会被重建,图得按锚点挂回去
+    for (const name of ['MESSAGE_SWIPED', 'MESSAGE_UPDATED', 'MESSAGE_EDITED'] as const) {
+      const eventName = events[name];
+      if (!eventName) continue;
+      ctx.eventSource.on(eventName, () => {
+        setTimeout(() => void hydrateAll(), 60);
+      });
+    }
+    // 往上翻历史:新露出来的楼层同样要补图
+    if (events.MORE_MESSAGES_LOADED) {
+      ctx.eventSource.on(events.MORE_MESSAGES_LOADED, () => {
+        setTimeout(() => {
+          void hydrateAll();
+          decorateAllFloors();
+        }, 120);
+      });
+    }
     ctx.eventSource.on(events.CHAT_CHANGED, () => {
       setTimeout(() => {
-        hydrateAll();
+        // 换聊天:先清掉上一聊天的状态卡,再把新聊天已存的图挂回去
+        resetFloorCards();
+        void hydrateAll();
         decorateAllFloors();
         addTopBarButton();
       }, 200);
@@ -181,8 +223,12 @@ void boot();
 const globalThisAny = globalThis as unknown as Record<string, unknown>;
 globalThisAny.htjZhongZhuan = {
   version: VERSION,
-  generate: (floor: number) => generateIntoFloor(floor),
-  generateWithStory: (story: string) => generateIntoFloor(-1, { story }),
-  openPanel: (tab?: 'render' | 'channel' | 'prompt') => togglePanel(tab ?? 'render'),
+  generate: (floor: number) => illustrateFloor(floor),
+  generateWithStory: (story: string) => illustrateFloor(-1, { story }),
+  openPanel: (tab?: 'render' | 'gallery' | 'channel' | 'chars' | 'prompt') => togglePanel(tab ?? 'render'),
   openSettings: () => document.getElementById('htj-zz-settings')?.scrollIntoView({ behavior: 'smooth' }),
+  /** 配置是否齐(控制台自查用)。 */
+  configProblems: () => configProblems(),
+  /** 自动插图内部状态(控制台自查:绑定成功没有、上次为什么失败)。 */
+  autoState: () => autoIllustrateState(),
 };

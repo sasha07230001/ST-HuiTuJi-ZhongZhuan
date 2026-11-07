@@ -111,6 +111,22 @@ export function joinNegative(dynamic: string, fixed: string): string {
 }
 
 /**
+ * 正向合成:恒定画风词**前置**。
+ *
+ * CLIP 的注意力对越靠前的 token 越敏感,而且不少采样器/工作流只吃前 75 个 token。
+ * 画风基线丢在末尾等于把最能定调的那几个词放到最容易被截断的位置——
+ * 所以恒定词必须在最前面,模型编译出来的具体画面描述跟在后面。
+ */
+export function composePositive(style: string, core: string): string {
+  return joinPositive(style ?? '', core ?? '');
+}
+
+/** 负面合成:恒定负面词同样前置。 */
+export function composeNegative(fixed: string, core: string): string {
+  return joinPositive(fixed ?? '', core ?? '');
+}
+
+/**
  * 正文清洗+提示词模板渲染。占位符 {{story}} {{note}} 换成实际文本,
  * 其余 `{{xxx}}` 原样保留(可能是用户想留给 ST 的宏)。
  */

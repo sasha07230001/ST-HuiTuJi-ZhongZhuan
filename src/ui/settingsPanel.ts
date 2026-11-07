@@ -10,9 +10,10 @@ import { getPlaceholders, WorkflowError } from '@/comfy/workflow';
 import { fetchRelayModels, testRelayConnection } from '@/relay/client';
 import { normalizeRelayUrl } from '@/relay/prompt';
 import { parseStoryScopeTagNames, type StoryScopePick } from '@/relay/storyScope';
+import { clampCount, MAX_SEGMENTS } from '@/relay/split';
 import { getSettings, saveSettings } from '@/state/settings';
 import { BUILTIN_WORKFLOW, DEFAULT_SETTINGS, type Settings } from '@/types';
-import { el, toast } from '@/ui/dom';
+import { applyConstantWordsToWorkflow, el, toast } from '@/ui/dom';
 import { resetOrbPosition, syncOrb } from '@/ui/orb';
 import { openPanel } from '@/ui/panel';
 
@@ -69,6 +70,16 @@ function buildPanel(): HTMLElement {
   bind(enabled, (next, _v, checked) => (next.enabled = checked));
   const autoRun = checkboxInput(s.autoRun);
   bind(autoRun, (next, _v, checked) => (next.autoRun = checked));
+  // 同一个 DOM 节点不能 append 两次(第二次会把它从第一个位置搬走),
+  // 所以「开关」和「剧情范围 / 自动插图」两处各建一个,状态互相同步。
+  const autoRunInline = checkboxInput(s.autoRun);
+  autoRunInline.addEventListener('change', () => {
+    autoRun.checked = autoRunInline.checked;
+    write(next => (next.autoRun = autoRunInline.checked));
+  });
+  autoRun.addEventListener('change', () => {
+    autoRunInline.checked = autoRun.checked;
+  });
 
   /* ---- 中转站 ---- */
   const relayUrl = textInput(s.relay.url, 'https://api.deepseek.com');
@@ -179,18 +190,127 @@ function buildPanel(): HTMLElement {
   bind(systemArea, (next, v) => (next.prompt.system = v));
   const wantNegative = checkboxInput(s.prompt.wantNegative);
   bind(wantNegative, (next, _v, checked) => (next.prompt.wantNegative = checked));
-  const styleInput = textInput(s.prompt.styleSuffix, 'masterpiece, best quality, ...');
-  bind(styleInput, (next, v) => (next.prompt.styleSuffix = v));
-  const negativeInput = textInput(s.prompt.negative, 'lowres, bad anatomy, ...');
-  bind(negativeInput, (next, v) => (next.prompt.negative = v));
   const retryInput = textInput(String(s.prompt.retryCount), '1', 'number');
   bind(retryInput, (next, v) => (next.prompt.retryCount = Math.max(0, Number(v) || 0)));
+
+  /* 恒定画风词 / 恒定负面词:显式保存按钮。
+   *
+   * 这两个串会前置到**每一次**出图的 CLIP 文本最前面,边打边存的问题很直观:
+   * 把 "cinematic lighting" 删到 "cinema" 的中间态会立刻跟着下一张图进采样器。
+   * 所以这里跟编译提示词(textarea)不同,不做 input 事件写回。 */
+  const styleInput = textInput(s.prompt.styleSuffix, 'masterpiece, best quality, ...');
+  const negativeInput = textInput(s.prompt.negative, 'lowres, bad anatomy, ...');
+  const saveStyle = el('button', { class: 'menu_button', type: 'button', text: '保存恒定画风词' });
+  saveStyle.addEventListener('click', () => {
+    write(next => (next.prompt.styleSuffix = styleInput.value.trim()));
+    styleInput.value = getSettings().prompt.styleSuffix;
+    toast('恒定画风词已保存:下次出图前置在正向最前面', 'success');
+  });
+  const saveNegative = el('button', { class: 'menu_button', type: 'button', text: '保存恒定负面词' });
+  saveNegative.addEventListener('click', () => {
+    write(next => (next.prompt.negative = negativeInput.value.trim()));
+    negativeInput.value = getSettings().prompt.negative;
+    toast('恒定负面词已保存:下次出图前置在负面最前面', 'success');
+  });
+
+  /**
+   * 保存并把两串写进工作流模板(设置抽屉里也有入口,不用专门开面板)。
+   * 只改 CLIP 文本节点,不动模型/采样器。
+   */
+  const saveAndSync = el('button', { class: 'menu_button', type: 'button', text: '保存并同步到 ComfyUI 工作流' });
+  saveAndSync.addEventListener('click', () => {
+    const style = styleInput.value.trim();
+    const neg = negativeInput.value.trim();
+    const current = getSettings();
+    const result = applyConstantWordsToWorkflow(current.comfy.workflow, style, neg);
+    if (!result.ok) {
+      toast(result.message, 'error');
+      return;
+    }
+    write(next => {
+      next.prompt.styleSuffix = style;
+      next.prompt.negative = neg;
+      if (result.changed) next.comfy.workflow = result.template;
+    });
+    if (result.changed) {
+      workflowArea.value = result.template;
+      updateWorkflowInfo();
+    }
+    toast(result.changed ? '已保存,并把恒定词前置写进工作流 CLIP 文本' : result.message, result.changed ? 'success' : 'info');
+  });
+  for (const [input, btn] of [
+    [styleInput, saveStyle] as const,
+    [negativeInput, saveNegative] as const,
+  ]) {
+    input.addEventListener('keydown', event => {
+      const key = (event as KeyboardEvent).key;
+      if (key !== 'Enter') return;
+      event.preventDefault();
+      (btn as HTMLButtonElement).click();
+    });
+  }
+
+  /* 出图张数 / 分段标记 */
+  const maxImages = textInput(String(s.prompt.maxImages), '1', 'number');
+  maxImages.min = '1';
+  maxImages.max = String(MAX_SEGMENTS);
+  bind(maxImages, (next, v) => {
+    const n = clampCount(v);
+    next.prompt.maxImages = n;
+    maxImages.value = String(n);
+  });
+  const markInput = textInput(s.prompt.segmentMark, '[[图]]');
+  bind(markInput, (next, v) => {
+    next.prompt.segmentMark = v.trim() || DEFAULT_SETTINGS.prompt.segmentMark;
+  });
+  markInput.addEventListener('change', () => {
+    markInput.value = getSettings().prompt.segmentMark;
+  });
+
+  /* 图库持久化 */
+  const galleryPersist = checkboxInput(s.gallery.persist);
+  bind(galleryPersist, (next, _v, checked) => (next.gallery.persist = checked));
+  const galleryLimit = textInput(String(s.gallery.limit), '300', 'number');
+  bind(galleryLimit, (next, v) => (next.gallery.limit = Math.max(1, Math.floor(Number(v) || 300))));
 
   const resetPrompt = el('button', { class: 'menu_button', type: 'button', text: '恢复默认提示词' });
   resetPrompt.addEventListener('click', () => {
     systemArea.value = DEFAULT_SETTINGS.prompt.system;
     write(next => (next.prompt.system = DEFAULT_SETTINGS.prompt.system));
     toast('已恢复默认编译提示词', 'success');
+  });
+
+  /* ---- purge 层 ---- */
+  const purgeEnabled = checkboxInput(s.purge.enabled);
+  bind(purgeEnabled, (next, _v, checked) => (next.purge.enabled = checked));
+  const purgeInject = checkboxInput(s.purge.injectSystem);
+  bind(purgeInject, (next, _v, checked) => (next.purge.injectSystem = checked));
+  const purgePrefill = checkboxInput(s.purge.prefill);
+  bind(purgePrefill, (next, _v, checked) => (next.purge.prefill = checked));
+  const purgeRewrite = checkboxInput(s.purge.rewrite);
+  bind(purgeRewrite, (next, _v, checked) => (next.purge.rewrite = checked));
+
+  const purgeArea = el('textarea', { class: 'text_pole textarea_compact htj-zz-purge', rows: '12' });
+  purgeArea.value = s.purge.systemPrompt;
+  bind(purgeArea, (next, v) => (next.purge.systemPrompt = v));
+
+  const prefillInput = textInput(s.purge.prefillText, 'POSITIVE:');
+  bind(prefillInput, (next, v) => (next.purge.prefillText = v));
+
+  const maxExtraInput = textInput(String(s.purge.maxExtraTags), '12', 'number');
+  bind(maxExtraInput, (next, v) => (next.purge.maxExtraTags = Math.max(0, Math.min(40, Number(v) || 0))));
+
+  const resetPurge = el('button', { class: 'menu_button', type: 'button', text: '恢复默认 purge 声明' });
+  resetPurge.addEventListener('click', () => {
+    purgeArea.value = DEFAULT_SETTINGS.purge.systemPrompt;
+    prefillInput.value = DEFAULT_SETTINGS.purge.prefillText;
+    maxExtraInput.value = String(DEFAULT_SETTINGS.purge.maxExtraTags);
+    write(next => {
+      next.purge.systemPrompt = DEFAULT_SETTINGS.purge.systemPrompt;
+      next.purge.prefillText = DEFAULT_SETTINGS.purge.prefillText;
+      next.purge.maxExtraTags = DEFAULT_SETTINGS.purge.maxExtraTags;
+    });
+    toast('已恢复默认 purge 声明', 'success');
   });
 
   /* ---- 悬浮球 / 面板入口 ---- */
@@ -291,11 +411,73 @@ function buildPanel(): HTMLElement {
         el('legend', { text: '编译提示词' }),
         el('small', { class: 'htj-zz-hint', text: '占位符:{{story}} 剧情正文、{{note}} 额外任务提示。' }),
         systemArea,
-        field('恒定画风词(追加在正向后面)', styleInput),
-        field('恒定负面词', negativeInput),
+        el('small', {
+          class: 'htj-zz-hint',
+          text: '恒定画风词 / 恒定负面词会在每次出图时前置到 ComfyUI 的 CLIP 文本最前面(填完点保存)。',
+        }),
+        field('恒定画风词(前置在正向最前)', styleInput),
+        el('div', { class: 'htj-zz-row' }, saveStyle),
+        field('恒定负面词(前置在负面最前)', negativeInput),
+        el('div', { class: 'htj-zz-row' }, saveNegative),
+        el('div', { class: 'htj-zz-row' }, saveAndSync),
         el('label', { class: 'checkbox_label' }, wantNegative, el('span', { text: '让模型额外输出负面词' })),
         field('失败重试次数', retryInput),
         resetPrompt,
+      ),
+
+      el(
+        'fieldset',
+        {},
+        el('legend', { text: '出图张数 / 分段' }),
+        el('small', {
+          class: 'htj-zz-hint',
+          text:
+            `一次出几张(1-${MAX_SEGMENTS})。>1 时按分段标记切正文,没写标记就均分;` +
+            '每张图出完插回它在正文里对应的那一段。',
+        }),
+        el('div', { class: 'htj-zz-row' }, field('出几张', maxImages), field('分段标记', markInput)),
+      ),
+
+      el(
+        'fieldset',
+        {},
+        el('legend', { text: '图库(持久化)' }),
+        el('label', { class: 'checkbox_label' }, galleryPersist, el('span', { text: '把出过的图存进浏览器(刷新不丢)' })),
+        field('每个聊天最多保留', galleryLimit),
+        el('small', {
+          class: 'htj-zz-hint',
+          text: '图存在 IndexedDB,不进 settings.json;关掉就回到「blob URL 刷新即失效」的旧行为。',
+        }),
+      ),
+
+      el(
+        'fieldset',
+        {},
+        el('legend', { text: 'purge 层(指令权威 / 反净化)' }),
+        el('small', {
+          class: 'htj-zz-hint',
+          text: '官网 API 会把 r18g 正文降级成温和 tag,这一层换掉模型的判断框架并补回被吃掉的词。',
+        }),
+        el('label', { class: 'checkbox_label' }, purgeEnabled, el('span', { text: '启用 purge 层' })),
+        el('label', { class: 'checkbox_label' }, purgeInject, el('span', { text: 'system 前压入权威声明(主路径)' })),
+        purgeArea,
+        el(
+          'div',
+          { class: 'htj-zz-row' },
+          el('label', { class: 'checkbox_label' }, purgePrefill, el('span', { text: 'assistant prefill' })),
+          field('prefill 文本', prefillInput),
+        ),
+        el(
+          'div',
+          { class: 'htj-zz-row' },
+          el('label', { class: 'checkbox_label' }, purgeRewrite, el('span', { text: '反净化重写' })),
+          field('最多补几条 tag', maxExtraInput),
+        ),
+        el('small', {
+          class: 'htj-zz-hint',
+          text: 'prefill 被端点拒绝(400)时会自动去掉重发,不影响出图。整个 purge 层关掉 = 完全回到旧行为。',
+        }),
+        resetPurge,
       ),
 
       el(
@@ -305,7 +487,7 @@ function buildPanel(): HTMLElement {
         el('small', { class: 'htj-zz-hint', text: '只把圈定标签包住的正文当剧情;留空 = 整楼都算,取不到时自动回退。' }),
         field('范围标签(逗号分隔)', scopeTags),
         field('同名块取哪个', scopePick),
-        el('label', { class: 'checkbox_label' }, autoRun, el('span', { text: '每生成一楼自动插图' })),
+        el('label', { class: 'checkbox_label' }, autoRunInline, el('span', { text: '每生成一楼自动插图' })),
       ),
 
       el(

@@ -8,6 +8,16 @@
  *
  * 位置存 localStorage(纯视觉态,各设备屏幕尺寸不同,同步反而会跑到屏幕外);
  * 显隐/尺寸/透明度走 extension_settings,跨设备同步。
+ *
+ * 「点一下闪一下就关」这条 bug 的完整成因(连续踩了三轮,写在这里免得再犯):
+ *   ① 触摸设备在 pointerup 之后会补发一套兼容鼠标事件(mousedown → mouseup → click),
+ *      目标正是刚铺满屏幕的遮罩 → 同一次点击里既「开」又「关」;
+ *   ② 手指抬起时有时只收到 pointercancel,moved 停在 0,老代码把它当成一次「很大的拖动」,
+ *      球被甩到边上,或者干脆没触发点击;
+ *   ③ 打开/关闭都走 togglePanel(),连点两下就是开→关。
+ * 现在:`pointerdown` 期间在**捕获期**对 document 装上兼容鼠标事件的拦截,
+ * `pointerup` 结束 400ms 后才撤;面板关掉后 400ms 内再点球不重开;
+ * `pointercancel` 只在真的移动过时才收尾,静止被取消就当点击处理。
  */
 
 import { getSettings } from '@/state/settings';
@@ -16,8 +26,13 @@ import { togglePanel } from '@/ui/panel';
 
 const POS_KEY = 'htjzz.orb.pos.v1';
 const SNAP_ZONE = 56;
+/** 鼠标的点击容差。 */
 const CLICK_SLOP = 6;
+/** 手指的点击容差:触摸总有几像素抖动,按鼠标的 6px 判会变成「拖了一下」。 */
+const TOUCH_SLOP = 14;
 const ORB_ID = 'htj-zz-orb';
+/** 触摸后吞掉兼容鼠标事件的时间窗。 */
+const GHOST_WINDOW_MS = 400;
 
 type Dock = 'left' | 'right' | 'none';
 
@@ -90,6 +105,11 @@ let startY = 0;
 let grabDX = 0;
 let grabDY = 0;
 let moved = 0;
+let pointerKind = 'mouse';
+/** 触摸操作发生后,到这一刻为止吞掉兼容鼠标事件。 */
+let ghostUntil = 0;
+/** 面板关掉后的冷却:这期间点球不再「开」,避免连点把新开的面板秒关。 */
+let tapCooldownUntil = 0;
 
 /**
  * 视口事件源。浏览器里就是 window;但模块可能在无 window 的环境求值,
@@ -100,7 +120,22 @@ function viewport(): Window | null {
 }
 
 function size(): number {
-  return Math.max(28, Math.min(96, Number(getSettings().orb.size) || 48));
+  const configured = Math.max(28, Math.min(96, Number(getSettings().orb.size) || 48));
+  // 触摸设备给一个 44px 的可点下限(Apple HIG 的最小触摸目标)
+  return coarsePointer() ? Math.max(44, configured) : configured;
+}
+
+/**
+ * 触摸设备没有 hover:贴边半隐会让球永远只露一半,手指很难点。
+ * 这类设备上一律整颗显示(尺寸由 CSS 再放大到最小 44px 的可点面积)。
+ */
+function coarsePointer(): boolean {
+  const vp = viewport();
+  try {
+    return !!vp?.matchMedia?.('(hover: none)')?.matches;
+  } catch {
+    return false;
+  }
 }
 
 function clampToViewport(): void {
@@ -131,7 +166,7 @@ function applyStyle(): void {
   // 计算值会退回上一个有效值(实测 left 顽固停在 1392px)。
   // 两侧的互斥一律交给下面的分支写死 px / auto。
 
-  const out = dragging || awake;
+  const out = dragging || awake || coarsePointer();
   // 贴边态故意错开自己的一半做「半隐」;free 态必须整颗落在视口内。
   const tuck = Math.round(s * 0.58);
   const vw = viewport()?.innerWidth || 0;
@@ -148,10 +183,42 @@ function applyStyle(): void {
   orbEl.style.transform = shift ? `translateX(${shift}px)` : 'translateX(0)';
 }
 
+/* ---------------- 兼容鼠标事件拦截 ---------------- */
+
+/**
+ * 触摸后浏览器补发的那套鼠标事件,目标会落在刚铺满屏幕的遮罩上。
+ * 在**捕获期**把它们掐掉(比遮罩自己的守卫更早,连 ST 的委托也收不到),
+ * 这样「同一次点击既开又关」就没有第二个来源了。
+ */
+const GHOST_MOUSE_EVENTS = ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'] as const;
+
+function swallowGhost(event: Event): void {
+  if (Date.now() > ghostUntil) return;
+  event.preventDefault?.();
+  event.stopPropagation?.();
+}
+
+function armGhostGuard(): void {
+  ghostUntil = Date.now() + GHOST_WINDOW_MS;
+  const doc = typeof document !== 'undefined' ? document : null;
+  if (!doc) return;
+  for (const name of GHOST_MOUSE_EVENTS) {
+    doc.addEventListener(name, swallowGhost, { capture: true, passive: false });
+  }
+  setTimeout(() => {
+    ghostUntil = 0;
+    for (const name of GHOST_MOUSE_EVENTS) doc.removeEventListener(name, swallowGhost, { capture: true });
+  }, GHOST_WINDOW_MS + 20);
+}
+
 /* ---------------- 拖动 ---------------- */
 
 function onDown(event: PointerEvent): void {
   if (!orbEl) return;
+  // 触摸/笔点上不要触发页面滚动或长按菜单,否则 pointerup 会被 pointercancel 抢走
+  event.preventDefault();
+  event.stopPropagation();
+  pointerKind = event.pointerType || 'mouse';
   activePointer = event.pointerId;
   dragging = true;
   moved = 0;
@@ -159,7 +226,12 @@ function onDown(event: PointerEvent): void {
   startY = event.clientY;
   grabDX = event.clientX - currentLeft();
   grabDY = event.clientY - pos.y;
-  orbEl.setPointerCapture?.(event.pointerId);
+  if (pointerKind !== 'mouse') armGhostGuard();
+  try {
+    orbEl.setPointerCapture?.(event.pointerId);
+  } catch {
+    /* 某些 WebView 没有 setPointerCapture */
+  }
   orbEl.classList.add('is-dragging');
   applyStyle();
 }
@@ -167,6 +239,9 @@ function onDown(event: PointerEvent): void {
 function onMove(event: PointerEvent): void {
   if (!dragging || event.pointerId !== activePointer) return;
   moved = Math.max(moved, Math.abs(event.clientX - startX) + Math.abs(event.clientY - startY));
+  // 还没超过容差就别开拖:球会跟着手指抖一下,看着像「点不准」
+  const slop = pointerKind === 'touch' ? TOUCH_SLOP : CLICK_SLOP;
+  if (moved < slop) return;
   pos.dock = 'none';
   pos.x = event.clientX - grabDX;
   pos.y = event.clientY - grabDY;
@@ -174,20 +249,12 @@ function onMove(event: PointerEvent): void {
   applyStyle();
 }
 
-function onUp(event: PointerEvent): void {
-  if (!dragging || event.pointerId !== activePointer) return;
-  dragging = false;
-  activePointer = null;
-  orbEl?.classList.remove('is-dragging');
+function isTap(): boolean {
+  const slop = pointerKind === 'touch' ? TOUCH_SLOP : CLICK_SLOP;
+  return moved < slop;
+}
 
-  if (moved < CLICK_SLOP) {
-    // 视为点击 → 开关面板(再把球滑出来,免得停在半隐状态)
-    awake = true;
-    applyStyle();
-    togglePanel();
-    return;
-  }
-
+function snapAfterDrag(): void {
   const left = pos.x;
   const right = (viewport()?.innerWidth || 0) - (pos.x + size());
   if (left <= SNAP_ZONE) pos.dock = 'left';
@@ -196,6 +263,57 @@ function onUp(event: PointerEvent): void {
   clampToViewport();
   applyStyle();
   savePos(pos);
+}
+
+/**
+ * 点击 → 开/关面板。
+ *
+ * 关掉面板后有 400ms 冷却:连点两下不应该把刚打开的面板又关掉(用户看到的就是
+ * 「闪一下」)。面板自己那边还有 OPEN_GUARD_MS,两道一起兜。
+ */
+function handleTap(): void {
+  const now = Date.now();
+  if (now < tapCooldownUntil) return;
+  const wasOpen = !!document.getElementById('htj-zz-panel-mask');
+  awake = true;
+  applyStyle();
+  togglePanel();
+  if (wasOpen) tapCooldownUntil = now + 400;
+}
+
+function onUp(event: PointerEvent): void {
+  if (!dragging || event.pointerId !== activePointer) return;
+  dragging = false;
+  activePointer = null;
+  orbEl?.classList.remove('is-dragging');
+
+  if (isTap()) {
+    // 视为点击 → 开关面板。
+    event.preventDefault();
+    event.stopPropagation();
+    handleTap();
+    return;
+  }
+  snapAfterDrag();
+}
+
+/**
+ * pointercancel:手指被系统手势/滚动抢走。
+ *
+ * 老实现无条件「收尾保存位置」,于是一次被取消的点按 = 球没动但也没打开面板;
+ * 更糟的是有的 WebView 先 cancel 再不发 up,球会粘在手上。
+ * 现在:真的移动过 → 收尾落位;根本没动 → 当成一次点击。
+ */
+function onCancel(event: PointerEvent): void {
+  if (event.pointerId !== activePointer) return;
+  dragging = false;
+  activePointer = null;
+  orbEl?.classList.remove('is-dragging');
+  if (isTap()) {
+    handleTap();
+    return;
+  }
+  snapAfterDrag();
 }
 
 /* ---------------- 挂载 ---------------- */
@@ -229,7 +347,13 @@ function mountOrb(): void {
   node.addEventListener('pointerdown', onDown);
   node.addEventListener('pointermove', onMove);
   node.addEventListener('pointerup', onUp);
-  node.addEventListener('pointercancel', onUp);
+  node.addEventListener('pointercancel', onCancel);
+  // 兼容鼠标事件也吞掉:老 WebView / 某些安卓浏览器只发 mousedown 那一套。
+  node.addEventListener('mousedown', event => event.stopPropagation());
+  node.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
   node.addEventListener('pointerenter', () => {
     awake = true;
     applyStyle();
@@ -249,7 +373,7 @@ function mountOrb(): void {
   node.addEventListener('keydown', event => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      togglePanel();
+      handleTap();
     }
   });
   // 双击 = 回到默认位置(球被拖到看不见的地方时的救命入口)
@@ -266,10 +390,21 @@ function mountOrb(): void {
   applyStyle();
 
   viewport()?.addEventListener('resize', onResize);
+  viewport()?.addEventListener('orientationchange', onResize);
+  // 移动端地址栏伸缩会改 visualViewport 高度,resize 不一定触发
+  (viewport() as unknown as { visualViewport?: { addEventListener?: (t: string, f: () => void) => void } })?.visualViewport?.addEventListener?.(
+    'resize',
+    onResize,
+  );
 }
 
 function unmountOrb(): void {
   viewport()?.removeEventListener('resize', onResize);
+  viewport()?.removeEventListener('orientationchange', onResize);
+  (viewport() as unknown as { visualViewport?: { removeEventListener?: (t: string, f: () => void) => void } })?.visualViewport?.removeEventListener?.(
+    'resize',
+    onResize,
+  );
   orbEl?.remove();
   orbEl = null;
 }

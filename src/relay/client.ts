@@ -20,6 +20,12 @@ import {
   withTimeout,
   validatePrompt,
 } from '@/relay/prompt';
+import {
+  injectPurge,
+  stripPrefill,
+  withPrefill,
+  type PurgeSettings,
+} from '@/relay/purge';
 import { getContext } from '@/st/context';
 
 export interface ChatMsg {
@@ -44,6 +50,43 @@ export interface RelayConn {
   temperature?: number;
   maxTokens?: number;
   timeoutSec?: number;
+  /** purge 层设置;不给就是原样发送(与旧行为完全一致)。 */
+  purge?: PurgeSettings;
+}
+
+/**
+ * 对消息列表套上 purge 层:system 前面压权威声明 + assistant prefill 起头。
+ *
+ * 这一步刻意放在 client 里而不是 orchestrator:自动建档(archive.ts)也走
+ * compilePrompt,它也吃正文、也会被降级,套同一层才说得通。
+ */
+export function applyPurge(
+  conn: Pick<RelayConn, 'purge'>,
+  messages: ChatMsg[],
+): { messages: ChatMsg[]; prefilled: boolean; prefillText: string } {
+  const p = conn.purge;
+  if (!p?.enabled) return { messages, prefilled: false, prefillText: '' };
+
+  let out: ChatMsg[] = messages;
+
+  if (p.injectSystem) {
+    const text = String(p.systemPrompt ?? '').trim();
+    if (text) {
+      const first = out[0];
+      if (first && first.role === 'system') {
+        out = [{ role: 'system', content: injectPurge(first.content, text) }, ...out.slice(1)];
+      } else {
+        // 没有 system 段(纯 user 请求,典型的建档请求)就自己开一个
+        out = [{ role: 'system', content: text }, ...out];
+      }
+    }
+  }
+
+  const prefillText = String(p.prefillText ?? '').trim();
+  if (p.prefill && prefillText) {
+    return { messages: withPrefill(out, prefillText) as ChatMsg[], prefilled: true, prefillText };
+  }
+  return { messages: out, prefilled: false, prefillText: '' };
 }
 
 /**
@@ -103,7 +146,13 @@ export interface RelayOptions {
 }
 
 /** 发一次补全,返回原始文本与最终采用的 base url。 */
-async function callOnce(conn: RelayConn, messages: ChatMsg[], base: string, opts: RelayOptions): Promise<string> {
+async function callOnce(
+  conn: RelayConn,
+  messages: ChatMsg[],
+  base: string,
+  opts: RelayOptions,
+  prefill?: { text: string },
+): Promise<string> {
   const ctx = getContext();
   if (!ctx) throw new RelayError('SillyTavern 上下文不可用');
   const body = buildRelayBody(conn, messages, base);
@@ -125,13 +174,32 @@ async function callOnce(conn: RelayConn, messages: ChatMsg[], base: string, opts
     if (err) throw new RelayError(typeof err === 'string' ? err : err.message || '中转站返回错误');
     const content = extractRelayContent(data);
     if (!content) throw new RelayError('中转站返回了空内容');
-    return content;
+    // 端点把 prefill 原样回显时,削掉开头的 POSITIVE: 之类,否则会污染 tag
+    return prefill?.text ? stripPrefill(content, prefill.text) : content;
   });
+}
+
+/**
+ * 端点不认 assistant prefill 时的识别:
+ * - 400/422:大多数中转站直接拒;
+ * - 400 里带 "assistant" / "last message" / "prefill" 的更明确。
+ * 这类错误重试无意义,直接去掉 prefill 再发一次。
+ */
+function looksLikePrefillRejection(error: unknown): boolean {
+  if (!(error instanceof RelayError)) return false;
+  const text = error.message.toLowerCase();
+  if (error.status === 422) return true;
+  if (error.status !== 400) return false;
+  return /assistant|prefill|last message|role|messages\[/i.test(text) || text.length < 40;
 }
 
 /**
  * 让中转站把剧情编译成 CLIP 提示词。失败会抛出人话错误,调用方负责 toast。
  * 返回值已剥掉代码块/前缀,但**还没**加恒定画风词——那是 settings 层的事。
+ *
+ * purge 层在这里生效(如果 conn.purge.enabled):
+ *   消息先过 applyPurge(system 压声明 + assistant prefill),
+ *   端点拒绝 prefill 时自动降级成无 prefill 再发一次,不让整个功能因为一个字段挂掉。
  */
 export async function compilePrompt(
   conn: RelayConn,
@@ -142,8 +210,23 @@ export async function compilePrompt(
   if (!conn.model.trim()) throw new RelayError('请先填写中转站模型名');
 
   const base = normalizeRelayUrl(conn.url);
+  const purged = applyPurge(conn, messages);
+  const prefill = purged.prefilled ? { text: purged.prefillText } : undefined;
+
+  /** 发一次;prefill 被端点拒时去掉 prefill 重发,这是 purge 层的自愈。 */
+  const send = async (targetBase: string): Promise<string> => {
+    try {
+      return await callOnce(conn, purged.messages, targetBase, opts, prefill);
+    } catch (error) {
+      if (!prefill || !looksLikePrefillRejection(error)) throw error;
+      console.info('[绘图姬·中转站] 该端点不接受 assistant prefill,本次改为普通请求');
+      const withoutPrefill = purged.messages.filter(m => !(m.role === 'assistant' && m.content === prefill.text));
+      return callOnce(conn, withoutPrefill as ChatMsg[], targetBase, opts);
+    }
+  };
+
   try {
-    const raw = await callOnce(conn, messages, base, opts);
+    const raw = await send(base);
     const text = unwrapPromptReply(raw);
     const verdict = validatePrompt(text);
     if (!verdict.ok) throw new RelayError(verdict.reason);
@@ -153,7 +236,7 @@ export async function compilePrompt(
     if (!opts.allowUrlFallback || (status !== 404 && status !== 405)) throw error;
     const fallback = alternateRelayUrl(base);
     if (!fallback || fallback === base) throw error;
-    const raw = await callOnce(conn, messages, fallback, { ...opts, allowUrlFallback: false });
+    const raw = await send(fallback);
     const text = unwrapPromptReply(raw);
     const verdict = validatePrompt(text);
     if (!verdict.ok) throw new RelayError(verdict.reason);

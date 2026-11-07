@@ -1,6 +1,6 @@
 {
   "name": "st-hui-tu-ji-zhong-zhuan",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "绘图姬·中转站：SillyTavern 扩展，把剧情正文先交给中转站模型编译成 ComfyUI CLIP 提示词，再送进 ComfyUI 出图",

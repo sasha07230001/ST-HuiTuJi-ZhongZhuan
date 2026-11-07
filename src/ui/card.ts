@@ -1,398 +1,498 @@
 /**
- * 楼层里的出图卡。
+ * 楼层出图:一条完整的「正文 → 分段 → 中转站 → CLIP → ComfyUI → 原位回插」。
  *
- * 设计取舍:
- * - 生成的数据(图片 data URL、提示词、状态)全部放在模块内的 Map 里,以
- *   「聊天 id + 楼层 + swipe」为键;正文里只存一个占位符 `<htj-zz-card seq="0">`。
- *   这样几千张 base64 图不会把聊天记录撑爆,ST 重渲染楼层也不会丢图。
- * - 卡片挂载是幂等的:楼层重渲染后重新 hydrate 一遍即可。
+ * 三条铁律(都是实测踩出来的,别改):
+ *
+ * 1. **绝不写 message.mes**。往正文插 `<htj-zz-card>` 会让 ST 整条消息重跑正则,
+ *    用户「状态美化 / 选项美化」的匹配区间被破坏,面板退化成源码。
+ * 2. **绝不调 updateMessageBlock 重渲染**。ST 的整楼重渲染会把正则产出的
+ *    iframe 全部拆掉且不再重建(实测 iframe 3 → 0)。
+ * 3. **图片必须是 data URL 落地**。ComfyUI 走的是 `URL.createObjectURL(blob)`,
+ *    那个句柄刷新即失效——这正是「图库刷新后全丢」的直接原因。所以出图后第一件事是
+ *    `toDataUrl()` 再存 IndexedDB,内存里只留副本。
+ *
+ * 图挂在哪由 split.ts 决定:正文里有 `[[图]]` 就按标记切,没有就按张数均分;
+ * 每一段带自己的 anchor(该段结尾若干字),出完图插回那段正文后面。
  */
 
-import { runWorkflow } from '@/comfy/api';
-import { randomSeed, renderWorkflow } from '@/comfy/workflow';
-import { runChain } from '@/relay/orchestrator';
+import { runChain, resolveStory } from '@/relay/orchestrator';
+import { clampCount, normalizeMark, planSegments, type StorySegment } from '@/relay/split';
 import { getSettings } from '@/state/settings';
-import { getContext, reloadMessageDom, type STMessage } from '@/st/context';
-
-export type CardState = 'idle' | 'running' | 'done' | 'error';
-
-export interface CardRecord {
-  /** 正向提示词(含画风词)。 */
-  positive: string;
-  /** 中转站原始输出。 */
-  compiled: string;
-  /** image data url;空 = 还没出图。 */
-  imageUrl: string;
-  state: CardState;
-  /** 运行中的人话状态 / 失败原因。 */
-  status: string;
-  seed: number;
-}
+import { getContext, isAiStoryMessage } from '@/st/context';
+import {
+  deleteStoredImage,
+  listFloorImages,
+  newImageId,
+  saveStoredImage,
+  storageHealth,
+  toDataUrl,
+  trimChatImages,
+  type StoredImage,
+} from '@/ui/galleryStore';
+import { hydrateFloorImages, insertFloorImage, INLINE_CLASS, type InlineImageOptions } from '@/ui/inlineImage';
 
 const TAG_NAME = 'htj-zz-card';
-const records = new Map<string, CardRecord>();
-const running = new Map<string, AbortController>();
+const STATUS_CLASS = 'htj-zz-card';
 
-function cardKey(chatId: string, floor: number, swipeId: number): string {
-  return `${chatId}\u0000${floor}\u0000${swipeId}`;
+/** 每楼一把「当前这一跑」的锁。 */
+const controllers = new Map<string, AbortController>();
+/** 楼层状态卡(生成中 / 失败);成功后退场,由插图接管。 */
+const statusCards = new Map<number, HTMLElement>();
+
+export interface IllustrateOptions {
+  /** 直接指定正文(公开接口 / 面板手填)。 */
+  story?: string;
+  /** 给模型的额外任务提示。 */
+  note?: string;
+  /** 这一次出几张;缺省读设置 prompt.maxImages。 */
+  count?: number;
+  /** 分段标记;缺省读设置 prompt.segmentMark。 */
+  mark?: string;
+  /** 显式指定锚点(单张图时插在指定正文片段之后)。 */
+  anchor?: string;
+  /**
+   * 跳过「先清掉这一楼上一轮的图」这一步。
+   *
+   * 图库页「插回正文」用得到:用户可能只想把某一张(可能是三天前那张)补回去,
+   * 不该顺手把这一楼当前挂着的其它图全撸掉。
+   */
+  keepExisting?: boolean;
+}
+
+/** split.ts 之外的补充:这一批图里第几张 / 共几张。 */
+export interface IllustrateMeta {
+  total: number;
+}
+
+export interface IllustrateResult {
+  floor: number;
+  segments: StorySegment[];
+  images: StoredImage[];
+  errors: string[];
 }
 
 function currentChatId(): string {
   return getContext()?.getCurrentChatId?.() ?? '';
 }
 
-function swipeOf(message: STMessage | undefined): number {
+function swipeOf(message: { swipe_id?: number } | undefined): number {
   return typeof message?.swipe_id === 'number' ? message.swipe_id : 0;
 }
 
-export function getCardRecord(key: string): CardRecord | undefined {
-  return records.get(key);
+function lockKey(chatId: string, floor: number): string {
+  return `${chatId}\u0000${floor}`;
 }
 
-export function setCardRecord(key: string, record: CardRecord): void {
-  records.set(key, record);
+function mesTextNode(floor: number): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`#chat .mes[mesid="${floor}"] .mes_text`);
 }
+
+/* ---------------- 旧版占位符清理(只清不写) ---------------- */
 
 /**
- * 旧版本残留的占位符清理器。
- *
- * 本扩展现在**不再往正文写占位符**;这个函数只用于把旧版留在聊天记录里的
- * `<htj-zz-card>` 洗掉(那些正是破坏用户正则的元凶)。新代码不应调用它以外的写操作。
+ * 旧版本留在聊天记录里的 `<htj-zz-card>` 清理器。
+ * 本扩展现在**不再往正文写任何标签**;这里只负责把历史残留洗掉。
  */
 export function stripCardPlaceholders(text: string): string {
   return text.replace(new RegExp(`<${TAG_NAME}[\\s\\S]*?</${TAG_NAME}>`, 'gi'), '').trimEnd();
 }
 
-/** 判断正文里是否残留旧版占位符。 */
 export function hasLegacyPlaceholder(text: string): boolean {
   return new RegExp(`<${TAG_NAME}`, 'i').test(text);
 }
 
-/**
- * 把某楼的一张图跑完整条链,并把状态推到卡片上。
- * 卡片 DOM 已挂载时实时更新;未挂载时只更新 record,下一次 hydrate 读取。
- */
-export async function generateIntoFloor(
-  floor: number,
-  options: { story?: string; note?: string; seq?: number } = {},
-): Promise<CardRecord | null> {
-  const ctx = getContext();
-  if (!ctx) return null;
-  const chatId = ctx.getCurrentChatId?.() ?? '';
-  const message = ctx.chat?.[floor];
-  const swipeId = swipeOf(message);
-  const key = cardKey(chatId, floor, swipeId);
-  const seq = options.seq ?? 0;
+/* ---------------- 状态卡 ---------------- */
 
-  running.get(key)?.abort();
-  const controller = new AbortController();
-  running.set(key, controller);
+function buildStatusCard(floor: number, title: string, status: string): HTMLElement {
+  const node = document.createElement('div');
+  node.className = STATUS_CLASS;
+  node.dataset.seq = 'status';
 
-  const record: CardRecord = records.get(key) ?? {
-    positive: '',
-    compiled: '',
-    imageUrl: '',
-    state: 'idle',
-    status: '',
-    seed: 0,
-  };
-  record.state = 'running';
-  record.status = '准备中…';
-  records.set(key, record);
-  // 先把卡片容器建出来:即使正文里的占位符还没渲染成 DOM,也要有个挂载点。
-  ensureCardContainer(floor, seq);
-  paint(floor, seq, record);
-
-  try {
-    const result = await runChain({
-      floor,
-      story: options.story,
-      note: options.note,
-      signal: controller.signal,
-      onStatus: text => {
-        record.status = text;
-        paint(floor, seq, record);
-      },
-    });
-    record.positive = result.positive;
-    record.compiled = result.compiled;
-    record.imageUrl = result.image.url;
-    record.seed = result.seed;
-    record.state = 'done';
-    record.status = '';
-    records.set(key, record);
-    // 出图成功 → 把图真正插进楼层并重渲染,而不是只改内存里的 record。
-    await commitImageToFloor(floor, record);
-    return record;
-  } catch (error) {
-    const aborted = controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError');
-    record.state = aborted ? 'idle' : 'error';
-    record.status = aborted ? '已取消' : error instanceof Error ? error.message : String(error);
-    records.set(key, record);
-    paint(floor, seq, record);
-    return record;
-  } finally {
-    if (running.get(key) === controller) running.delete(key);
-  }
-}
-
-/**
- * 把记录里的图落进楼层。
- *
- * 两条铁律(都是实测踩出来的):
- *
- * 1. **绝不写 message.mes**。往正文插 `<htj-zz-card>` 会让 ST 整条消息重跑正则,
- *    用户「状态美化 / 选项美化」的匹配区间被破坏,面板退化成源码。
- * 2. **绝不调 updateMessageBlock 重渲染**。ST 的整楼重渲染会把正则产出的
- *    iframe 全部拆掉且不再重建(实测 iframe 3 → 0),状态栏直接消失。
- *
- * 所以卡片只活在 DOM 层:直接在 .mes_text 末尾挂一个节点。
- * 楼层被 ST 重渲染时(切 swipe、编辑等),由 hydrateAll 重新挂回。
- */
-async function commitImageToFloor(floor: number, record: CardRecord): Promise<void> {
-  // .mes_text 可能正被 ST 替换,给它几个短帧重试;但不触发任何重渲染。
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const holder = ensureCardContainer(floor, 0);
-    if (holder) {
-      renderCardInto(holder, record, floor, 0);
-      return;
-    }
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-}
-
-/**
- * 保证楼层 DOM 里有一个 .htj-zz-card 挂载点。
- *
- * 只在 .mes_text 末尾追加,不依赖正文里存在任何标签——
- * 因为本扩展不再往 message.mes 里写占位符。
- */
-function ensureCardContainer(floor: number, seq: number): HTMLElement | null {
-  const mesNode = document.querySelector<HTMLElement>(`#chat .mes[mesid="${floor}"]`);
-  const textNode = mesNode?.querySelector<HTMLElement>('.mes_text');
-  if (!textNode) return null;
-  ensureStyle();
-
-  const existing = textNode.querySelector<HTMLElement>(`.htj-zz-card[data-seq="${seq}"]`);
-  if (existing) return existing;
-
-  const holder = document.createElement('div');
-  holder.className = 'htj-zz-card';
-  holder.dataset.seq = String(seq);
-  textNode.append(holder);
-  return holder;
-}
-
-/** 取消某楼在跑的生成。 */
-export function cancelFloor(floor: number): void {
-  const ctx = getContext();
-  const key = cardKey(ctx?.getCurrentChatId?.() ?? '', floor, swipeOf(ctx?.chat?.[floor]));
-  running.get(key)?.abort();
-}
-
-/* ---------------- DOM ---------------- */
-
-function paint(floor: number, seq: number, record: CardRecord): void {
-  // 注意:按 **class** 找,不按标签名。挂载点是我们自己造的 div.htj-zz-card;
-  // 用标签名 htj-zz-card 会永远匹配不到(已实测踩到,表现为卡片空白无内容)。
-  const node = document.querySelector<HTMLElement>(
-    `#chat .mes[mesid="${floor}"] .htj-zz-card[data-seq="${seq}"]`,
-  );
-  if (node) renderCardInto(node, record, floor, seq);
-}
-
-function renderCardInto(node: HTMLElement, record: CardRecord, floor: number, seq: number): void {
-  let body = node.querySelector<HTMLElement>('.htj-zz-card-body');
-  if (!body) {
-    body = document.createElement('div');
-    body.className = 'htj-zz-card-body';
-    node.append(body);
-  }
-
-  const title =
-    record.state === 'running'
-      ? '绘图姬·中转站 · 生成中'
-      : record.state === 'error'
-        ? '绘图姬·中转站 · 失败'
-        : '绘图姬·中转站';
+  const body = document.createElement('div');
+  body.className = 'htj-zz-card-body';
 
   const head = document.createElement('div');
   head.className = 'htj-zz-card-head';
-  const titleEl = document.createElement('b');
-  titleEl.textContent = title;
-  const statusEl = document.createElement('span');
-  statusEl.className = 'htj-zz-card-status';
-  statusEl.textContent = record.status || '';
-  head.append(titleEl, statusEl);
+  const name = document.createElement('b');
+  name.textContent = title;
+  const state = document.createElement('span');
+  state.className = 'htj-zz-card-status';
+  state.textContent = status;
+  head.append(name, state);
+
+  body.append(head);
+  node.append(body);
+  return node;
+}
+
+function ensureStatusCard(floor: number, title = '绘图姬·中转站', status = ''): HTMLElement | null {
+  const host = mesTextNode(floor);
+  if (!host) return null;
+  let node = statusCards.get(floor);
+  if (!node || !node.isConnected) {
+    node = buildStatusCard(floor, title, status);
+    statusCards.set(floor, node);
+    host.append(node);
+  }
+  paintStatus(floor, title, status, []);
+  return node;
+}
+
+function paintStatus(floor: number, title: string, status: string, actions: Array<{ label: string; run: () => void }>): void {
+  const node = statusCards.get(floor);
+  if (!node) return;
+  const body = node.querySelector<HTMLElement>('.htj-zz-card-body');
+  if (!body) return;
+  const head = document.createElement('div');
+  head.className = 'htj-zz-card-head';
+  const name = document.createElement('b');
+  name.textContent = title;
+  const state = document.createElement('span');
+  state.className = 'htj-zz-card-status';
+  state.textContent = status;
+  head.append(name, state);
 
   const parts: Node[] = [head];
-
-  if (record.imageUrl) {
-    const link = document.createElement('a');
-    link.href = record.imageUrl;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    link.className = 'htj-zz-card-image';
-    const img = document.createElement('img');
-    img.src = record.imageUrl;
-    img.alt = '生成的图片';
-    link.append(img);
-    parts.push(link);
+  if (actions.length) {
+    const row = document.createElement('div');
+    row.className = 'htj-zz-card-actions';
+    for (const action of actions) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'menu_button htj-zz-card-btn';
+      btn.textContent = action.label;
+      btn.addEventListener('click', event => {
+        event.stopPropagation();
+        action.run();
+      });
+      row.append(btn);
+    }
+    parts.push(row);
   }
-  if (record.positive) parts.push(promptBlock('正向提示词', record.positive));
-  if (record.compiled && record.compiled !== record.positive) {
-    parts.push(promptBlock('中转站原始输出', record.compiled));
-  }
-  parts.push(controls(floor, seq, record));
-
   body.replaceChildren(...parts);
 }
 
-function promptBlock(label: string, text: string): HTMLElement {
-  const wrap = document.createElement('details');
-  wrap.className = 'htj-zz-card-prompt';
-  const summary = document.createElement('summary');
-  summary.textContent = label;
-  const pre = document.createElement('pre');
-  pre.textContent = text;
-  wrap.append(summary, pre);
-  return wrap;
+function dropStatusCard(floor: number): void {
+  statusCards.get(floor)?.remove();
+  statusCards.delete(floor);
 }
 
-function controls(floor: number, seq: number, record: CardRecord): HTMLElement {
-  const row = el('div', 'htj-zz-card-actions');
-  const running_ = record.state === 'running';
+/* ---------------- 插图 ---------------- */
 
-  const regen = button('重新生成', () => {
-    void generateIntoFloor(floor, { seq });
-  }, running_);
-  const cancel = button('取消', () => cancelFloor(floor), !running_);
-
-  const copy = button('复制提示词', () => {
-    if (!record.positive) return;
-    void navigator.clipboard?.writeText(record.positive);
-  }, !record.positive);
-
-  const edit = button('编辑提示词', async () => {
-    const next = window.prompt('修改正向提示词(保存后重新出图)', record.positive);
-    if (next === null) return;
-    const trimmed = next.trim();
-    if (!trimmed) return;
-    await regenerateWithPrompt(floor, seq, trimmed);
-  }, running_ || !record.positive);
-
-  const remove = button('移除卡片', () => {
-    // 只删 DOM 节点与记录,不碰正文——正文归用户和正则脚本所有
-    const ctx = getContext();
-    const key = cardKey(ctx?.getCurrentChatId?.() ?? '', floor, swipeOf(ctx?.chat?.[floor]));
-    records.delete(key);
-    running.get(key)?.abort();
-    document
-      .querySelectorAll<HTMLElement>(`#chat .mes[mesid="${floor}"] .htj-zz-card[data-seq="${seq}"]`)
-      .forEach(node => node.remove());
-  });
-
-  row.append(regen, cancel, copy, edit, remove);
-  return row;
-}
-
-/** 用一张手改过的提示词直接出图(跳过中转站)。 */
-async function regenerateWithPrompt(floor: number, seq: number, positive: string): Promise<void> {
-  const ctx = getContext();
-  const key = cardKey(ctx?.getCurrentChatId?.() ?? '', floor, swipeOf(ctx?.chat?.[floor]));
-  const record = records.get(key);
-  if (!record) return;
-  const s = getSettings();
-  record.state = 'running';
-  record.status = '按手改的提示词出图…';
-  paint(floor, seq, record);
-  try {
-    const seed = randomSeed();
-    const workflow = renderWorkflow(s.comfy.workflow, { prompt: positive, negative: s.prompt.negative, seed });
-    const image = await runWorkflow(s.comfy, workflow);
-    record.positive = positive;
-    record.imageUrl = image.url;
-    record.seed = seed;
-    record.state = 'done';
-    record.status = '';
-  } catch (error) {
-    record.state = 'error';
-    record.status = error instanceof Error ? error.message : String(error);
-  }
-  records.set(key, record);
-  paint(floor, seq, record);
-}
-
-function button(label: string, onClick: () => void, disabled = false): HTMLButtonElement {
-  const node = document.createElement('button');
-  node.type = 'button';
-  node.className = 'menu_button htj-zz-card-btn';
-  node.textContent = label;
-  node.disabled = disabled;
-  node.addEventListener('click', event => {
-    event.stopPropagation();
-    onClick();
-  });
-  return node;
-}
-
-function el(tag: string, className: string, ...children: (Node | null)[]): HTMLElement {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  for (const child of children) if (child) node.append(child);
-  return node;
-}
-
-/* ---------------- 挂载 ---------------- */
-
-/** 给自定义元素定义样式(只在第一次挂载时注入)。 */
-function ensureStyle(): void {
-  if (document.getElementById('htj-zz-style')) return;
-  const style = document.createElement('style');
-  style.id = 'htj-zz-style';
-  style.textContent = CARD_CSS;
-  document.head.append(style);
+function captionOf(index: number, total: number, positive: string): string {
+  const brief = positive.replace(/\s+/g, ' ').slice(0, 60);
+  return total > 1 ? `第 ${index + 1}/${total} 张 · ${brief}` : brief;
 }
 
 /**
- * 把内存里的出图记录挂回楼层 DOM。幂等,ST 每次重渲染消息后都要调一次。
- * 只读 message,绝不写——正文归用户和正则脚本所有。
+ * 让这一楼的插图顺序与库里的顺序一致。
+ *
+ * 图库「插回正文」是单张动作,只把那一张补回它自己的锚点;顺序由 hydrateFloor 管。
+ * 这里不复用 hydrateFloor 是因为它会把整楼重排一遍(其它楼层正在生成的图会被摘掉)。
  */
-export function hydrateFloor(floor: number): void {
+
+/** 把一张图挂进楼层(楼层 DOM 还没渲染出来时短暂重试)。 */
+async function placeImage(floor: number, entry: StoredImage, caption: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const ok = insertFloorImage(floor, {
+      id: entry.id,
+      image: entry.image,
+      anchor: entry.anchor,
+      caption,
+      onRemove: id => {
+        void deleteStoredImage(id);
+        document
+          .querySelectorAll<HTMLElement>(`.${INLINE_CLASS}[data-htj-image-id="${id}"]`)
+          .forEach(node => node.remove());
+      },
+    });
+    if (ok) return true;
+    await new Promise(resolve => setTimeout(resolve, 60));
+  }
+  return false;
+}
+
+/* ---------------- 主入口 ---------------- */
+
+/**
+ * 给某一楼出图。
+ *
+ * - 张数来自 `count`(缺省设置里的 prompt.maxImages);
+ * - 正文里写了标记(`[[图]]`)就按标记切,否则按张数均分;
+ * - 每张出完立刻落地 + 插回对应段落;失败的那张单独记错误,不影响其它张。
+ */
+export async function illustrateFloor(floor: number, options: IllustrateOptions = {}): Promise<IllustrateResult> {
+  const ctx = getContext();
+  const chatId = currentChatId();
+  const message = ctx?.chat?.[floor];
+  const result: IllustrateResult = { floor, segments: [], images: [], errors: [] };
+
+  /** 手填正文时允许 floor = -1:只出图,没有可插的楼层。 */
+  const standalone = Boolean(options.story?.trim());
+  if (!ctx || !Number.isInteger(floor) || (floor < 0 && !standalone)) {
+    result.errors.push('楼层号无效');
+    return result;
+  }
+  if (!standalone && !isAiStoryMessage(message)) {
+    result.errors.push('这一楼不是可配图的剧情楼(用户楼 / 系统楼)');
+    return result;
+  }
+
+  const settings = getSettings();
+  const swipe = swipeOf(message);
+  const key = lockKey(chatId, floor);
+
+  // 同一楼重复点 = 打断上一跑,不叠加
+  controllers.get(key)?.abort();
+  const controller = new AbortController();
+  controllers.set(key, controller);
+
+  const total = clampCount(options.count ?? settings.prompt.maxImages);
+  const mark = normalizeMark(options.mark ?? settings.prompt.segmentMark);
+
+  let story = options.story?.trim() ?? '';
+  if (!story) {
+    try {
+      story = resolveStory(floor).story;
+    } catch (error) {
+      result.errors.push(error instanceof Error ? error.message : String(error));
+      return result;
+    }
+  }
+
+  const segments = planSegments(story, { count: total, mark });
+  result.segments = segments;
+  if (!segments.length) {
+    result.errors.push('正文是空的,没有可编译的内容');
+    return result;
+  }
+
+  // 重出这一楼:先把上一轮插进去的图清场,免得叠成一片
+  if (!options.keepExisting) {
+    document
+      .querySelectorAll<HTMLElement>(`#chat .mes[mesid="${floor}"] .${INLINE_CLASS}`)
+      .forEach(node => node.remove());
+  }
+
+  ensureStatusCard(floor, '绘图姬·中转站 · 生成中', `0/${segments.length} 准备中…`);
+
+  try {
+    for (const [index, segment] of segments.entries()) {
+      const label = segments.length > 1 ? `第 ${index + 1}/${segments.length} 张` : '';
+      paintStatus(floor, '绘图姬·中转站 · 生成中', `${label} 正在编译提示词…`, []);
+
+      const note =
+        segments.length > 1
+          ? `这是整楼里的第 ${index + 1}/${segments.length} 个画面,只画这一段里正在发生的事,不要画其它段落。` +
+            (options.note ? ` ${options.note}` : '')
+          : options.note ?? '';
+
+      const output = await runChain({
+        floor,
+        story: segment.text,
+        note,
+        signal: controller.signal,
+        onStatus: text => paintStatus(floor, '绘图姬·中转站 · 生成中', `${label} ${text}`, []),
+      });
+
+      paintStatus(floor, '绘图姬·中转站 · 生成中', `${label} 正在落地图片…`, []);
+
+      // blob URL → data URL:不转成 base64,刷新后就是一片空白
+      const image = await toDataUrl(output.image.url);
+      try {
+        output.image.revoke();
+      } catch {
+        /* 已经是 data URL 时没有可释放的句柄 */
+      }
+
+      const anchor = options.anchor && segments.length === 1 ? options.anchor : segment.anchor;
+      const entry: StoredImage = {
+        id: newImageId(),
+        chatId,
+        floor,
+        swipe,
+        index,
+        total: segments.length,
+        positive: output.positive,
+        negative: output.negative,
+        compiled: output.compiled,
+        seed: output.seed,
+        image,
+        anchor,
+        anchorStart: segment.anchorStart,
+        segmentIndex: index,
+        createdAt: Date.now(),
+      };
+
+      const persisted = settings.gallery.persist && !!image;
+      if (settings.gallery.persist) {
+        // 存进去(即便 image 是空串也别丢掉这条记录:提示词、锚点、seed 还有用;
+        // 水合时会在正文里画一个「图丢了」的占位,点开能重新出)。
+        await saveStoredImage(entry);
+        await trimChatImages(chatId, settings.gallery.limit);
+        if (!image) {
+          result.errors.push('图片没能转成 data URL,刷新后会丢;这张的提示词仍保存在图库');
+        }
+      }
+      if (!persisted && settings.gallery.persist) {
+        const health = await storageHealth();
+        if (!health.ok) result.errors.push(`图库落盘不可用:${health.message}`);
+      }
+      result.images.push(entry);
+      if (floor >= 0) await placeImage(floor, entry, captionOf(index, segments.length, output.positive));
+      paintStatus(floor, '绘图姬·中转站 · 生成中', `${label} 完成(${index + 1}/${segments.length})`, []);
+    }
+
+    dropStatusCard(floor);
+    return result;
+  } catch (error) {
+    const aborted =
+      controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError');
+    const messageText = aborted ? '已取消' : error instanceof Error ? error.message : String(error);
+    result.errors.push(messageText);
+    if (result.images.length) {
+      // 已经出了几张:状态卡退场,图留着
+      dropStatusCard(floor);
+    } else {
+      ensureStatusCard(floor, '绘图姬·中转站 · 失败', messageText);
+      paintStatus(floor, '绘图姬·中转站 · 失败', messageText, [
+        { label: '重试', run: () => void illustrateFloor(floor, options) },
+        { label: '关闭', run: () => dropStatusCard(floor) },
+      ]);
+    }
+    return result;
+  } finally {
+    if (controllers.get(key) === controller) controllers.delete(key);
+  }
+}
+
+/** 兼容旧调用点的名字:返回本次出图结果(不再返回内存 record)。 */
+export async function generateIntoFloor(
+  floor: number,
+  options: IllustrateOptions = {},
+): Promise<IllustrateResult> {
+  return illustrateFloor(floor, options);
+}
+
+/** 取消某楼正在跑的生成(含多张里已排队的那几张)。 */
+export function cancelFloor(floor: number): void {
+  controllers.get(lockKey(currentChatId(), floor))?.abort();
+}
+
+/* ---------------- 水合:刷新后把图挂回去 ---------------- */
+
+/** 这一楼当前 DOM 里已经挂着的图 id 顺序。 */
+function renderedIds(floor: number): string[] {
+  return [...document.querySelectorAll<HTMLElement>(`#chat .mes[mesid="${floor}"] .${INLINE_CLASS}`)]
+    .map(node => node.dataset.htjImageId ?? '')
+    .filter(Boolean);
+}
+
+/** 把某一楼已存下来的图挂回正文(幂等:顺序没变就什么都不做)。 */
+export async function hydrateFloor(floor: number): Promise<void> {
   const ctx = getContext();
   const message = ctx?.chat?.[floor];
   if (!message) return;
-  const key = cardKey(ctx?.getCurrentChatId?.() ?? '', floor, swipeOf(message));
-  const record = records.get(key);
-  if (!record) return;
-  const holder = ensureCardContainer(floor, 0);
-  if (holder) renderCardInto(holder, record, floor, 0);
+  if (!mesTextNode(floor)) return;
+
+  const chatId = currentChatId();
+  const swipe = swipeOf(message);
+  const stored = await listFloorImages(chatId, floor, swipe);
+  const wanted = stored.map(entry => entry.id);
+  const existing = renderedIds(floor);
+  if (wanted.length === existing.length && wanted.every((id, i) => id === existing[i])) return;
+
+  hydrateFloorImages(
+    floor,
+    stored.map(entry => ({
+      id: entry.id,
+      image: entry.image,
+      anchor: entry.anchor,
+      anchorStart: entry.anchorStart ?? '',
+      caption: captionOf(entry.index, stored.length, entry.positive),
+      onRemove: id => {
+        void deleteStoredImage(id);
+        document
+          .querySelectorAll<HTMLElement>(`.${INLINE_CLASS}[data-htj-image-id="${id}"]`)
+          .forEach(node => node.remove());
+      },
+    })),
+  );
 }
 
-/** 把全聊天里还带着占位符的楼层都挂一遍。 */
-export function hydrateAll(): void {
+/** 把当前聊天里所有已渲染楼层的图挂回去。 */
+export async function hydrateAll(): Promise<void> {
   const ctx = getContext();
   if (!ctx?.chat) return;
-  for (let floor = 0; floor < ctx.chat.length; floor++) hydrateFloor(floor);
+  for (let floor = 0; floor < ctx.chat.length; floor++) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await hydrateFloor(floor);
+    } catch {
+      /* 单楼失败不该拖垮整轮水合 */
+    }
+  }
 }
 
-const CARD_CSS = `
-.htj-zz-card {
-  margin: 0.75em 0;
-  padding: 0.75em;
-  border-radius: 10px;
-  border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.35));
-  background: var(--SmartThemeBlurTintColor, rgba(0,0,0,.15));
-  font-size: 0.95em;
+/* ---------------- 图库 → 正文 ---------------- */
+
+/**
+ * 把一张**已存在的**图挂回它自己的楼层与段落(图库页「插回正文」)。
+ *
+ * 与 hydrateFloor 的区别:这是显式动作,楼层里已经挂着这张图时也要重新插一遍
+ * (用户可能刚删过 DOM 上的那张),并且不碰这一楼的其它图。
+ *
+ * @returns 是否真的插进 DOM(楼层还没渲染出来 → false,调用方提示用户先滚到那一楼)
+ */
+export async function insertStoredImageIntoFloor(entry: StoredImage): Promise<boolean> {
+  const ctx = getContext();
+  if (!ctx) return false;
+  if (entry.floor < 0) return false;
+  if ((ctx.getCurrentChatId?.() ?? '') !== entry.chatId) return false;
+  const total = entry.total && entry.total > 0 ? entry.total : 1;
+  const caption = captionOf(entry.index, total, entry.positive);
+  const options: InlineImageOptions = {
+    id: entry.id,
+    image: entry.image,
+    anchor: entry.anchor,
+    anchorStart: entry.anchorStart,
+    caption,
+    onRemove: id => {
+      void deleteStoredImage(id);
+      document
+        .querySelectorAll<HTMLElement>(`.${INLINE_CLASS}[data-htj-image-id="${id}"]`)
+        .forEach(node => node.remove());
+    },
+  };
+  // 已经挂着同一个 id:换掉它(用户可能手动删过锚点上的位置)
+  document
+    .querySelectorAll<HTMLElement>(`#chat .mes[mesid="${entry.floor}"] .${INLINE_CLASS}[data-htj-image-id="${entry.id}"]`)
+    .forEach(node => node.remove());
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (insertFloorImage(entry.floor, options)) return true;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise(resolve => setTimeout(resolve, 80));
+  }
+  return false;
 }
-.htj-zz-card-head { display: flex; gap: .75em; align-items: baseline; flex-wrap: wrap; margin-bottom: .5em; }
-.htj-zz-card-head b { font-weight: 600; }
-.htj-zz-card-status { opacity: .75; font-size: .85em; }
-.htj-zz-card-image { display: block; }
-.htj-zz-card-image img { max-width: 100%; border-radius: 8px; display: block; }
-.htj-zz-card-prompt { margin: .5em 0 0; font-size: .85em; }
-.htj-zz-card-prompt summary { cursor: pointer; opacity: .8; }
-.htj-zz-card-prompt pre { white-space: pre-wrap; word-break: break-word; margin: .35em 0 0; opacity: .9; }
-.htj-zz-card-actions { display: flex; gap: .5em; flex-wrap: wrap; margin-top: .6em; }
-.htj-zz-card-btn { width: auto !important; }
-`;
+
+/** 让楼层滚进视野(图库点「插回正文」之后)。 */
+export function revealFloor(floor: number): void {
+  const node = document.querySelector<HTMLElement>(`#chat .mes[mesid="${floor}"]`);
+  if (!node) return;
+  try {
+    node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  } catch {
+    node.scrollIntoView();
+  }
+  node.classList.add('htj-zz-flash');
+  setTimeout(() => node.classList.remove('htj-zz-flash'), 1200);
+}
+
+/** 把当前聊天里所有已渲染楼层的图挂回去。 */
+
+/** 换聊天:清掉上一轮的 DOM 状态(图本身按 chatId 隔离,不会串)。 */
+export function resetFloorCards(): void {
+  statusCards.forEach(node => node.remove());
+  statusCards.clear();
+}

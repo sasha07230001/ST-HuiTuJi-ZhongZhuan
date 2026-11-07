@@ -18,7 +18,26 @@ import {
   type CharEntry,
   type CharField,
 } from '@/chars/profile';
-import { deleteCharEntry, getCharLibrary, saveCharEntry, setCharLibrary } from '@/chars/store';
+import {
+  clearAllTransients,
+  clearTransient,
+  deleteCharEntry,
+  getCharLibrary,
+  getTransients,
+  saveCharEntry,
+  saveTransient,
+  setCharLibrary,
+  setTransients,
+} from '@/chars/store';
+import {
+  emptyTransient,
+  findTransient,
+  mergeTransientTags,
+  transientToClipTags,
+  transientToTags,
+  TRANSIENT_FIELD_ORDER,
+  type TransientProfile,
+} from '@/chars/transient';
 import { getSettings, saveSettings } from '@/state/settings';
 import { el, toast } from '@/ui/dom';
 
@@ -49,8 +68,196 @@ export function buildCharsPage(notify: Notify): HTMLElement {
     saveSettings(next);
   });
 
+  // ---- 临时档案开关 ----
+  const transientCfg = getSettings().chars.transient;
+  const tEnabled = el('input', { type: 'checkbox' }) as HTMLInputElement;
+  tEnabled.checked = transientCfg.enabled !== false;
+  tEnabled.addEventListener('change', () => {
+    const next = getSettings();
+    next.chars.transient.enabled = tEnabled.checked;
+    saveSettings(next);
+    notify();
+  });
+
+  const tAuto = el('input', { type: 'checkbox' }) as HTMLInputElement;
+  tAuto.checked = transientCfg.autoUpdate !== false;
+  tAuto.addEventListener('change', () => {
+    const next = getSettings();
+    next.chars.transient.autoUpdate = tAuto.checked;
+    saveSettings(next);
+  });
+
+  const tOverride = el('input', { type: 'checkbox' }) as HTMLInputElement;
+  tOverride.checked = transientCfg.overrideFixed !== false;
+  tOverride.addEventListener('change', () => {
+    const next = getSettings();
+    next.chars.transient.overrideFixed = tOverride.checked;
+    saveSettings(next);
+    notify();
+  });
+
+  const tReset = el('input', { type: 'checkbox' }) as HTMLInputElement;
+  tReset.checked = transientCfg.resetOnChatChange !== false;
+  tReset.addEventListener('change', () => {
+    const next = getSettings();
+    next.chars.transient.resetOnChatChange = tReset.checked;
+    saveSettings(next);
+  });
+
+  const tOnlyKnown = el('input', { type: 'checkbox' }) as HTMLInputElement;
+  tOnlyKnown.checked = transientCfg.onlyKnown !== false;
+  tOnlyKnown.addEventListener('change', () => {
+    const next = getSettings();
+    next.chars.transient.onlyKnown = tOnlyKnown.checked;
+    saveSettings(next);
+  });
+
   const listBox = el('div', { class: 'htj-zz-charlist' });
   const editorBox = el('div', { class: 'htj-zz-chareditor' });
+  const transientBox = el('div', { class: 'htj-zz-charlist' });
+
+  // ---- 临时档案编辑器 ----
+  const transientEditor = el('div', { class: 'htj-zz-chareditor htj-zz-hide' });
+
+  function openTransientEditor(name: string): void {
+    const entry = getCharLibrary().find(e => e.name.toLowerCase() === name.toLowerCase());
+    const existing = findTransient(getTransients(), name);
+    const draft = existing ?? emptyTransient(name);
+
+    const rawInput = el('textarea', { class: 'text_pole htj-zz-textarea', rows: '3' }) as HTMLTextAreaElement;
+    rawInput.value = draft.raw;
+    rawInput.placeholder = '这一刻的完整 tag,如 black lace bra, black lace panties(整串替换)';
+
+    const fieldInputs = new Map<CharField, HTMLInputElement>();
+    const grid = el('div', { class: 'htj-zz-grid2' });
+    for (const field of TRANSIENT_FIELD_ORDER) {
+      const input = el('input', {
+        class: 'text_pole',
+        type: 'text',
+        value: draft.fields[field] ?? '',
+        placeholder: CHAR_FIELD_LABELS[field],
+      }) as HTMLInputElement;
+      fieldInputs.set(field, input);
+      grid.append(
+        el('label', { class: 'htj-zz-field' },
+          el('span', { class: 'htj-zz-label', text: CHAR_FIELD_LABELS[field] }),
+          input,
+        ),
+      );
+    }
+
+    const frozenBox = el('input', { type: 'checkbox' }) as HTMLInputElement;
+    frozenBox.checked = draft.frozen;
+
+    const preview = el('div', { class: 'htj-zz-hint' });
+    const updatePreview = () => {
+      const previewDraft = {
+        ...draft,
+        raw: rawInput.value.trim(),
+        fields: Object.fromEntries([...fieldInputs].map(([k, v]) => [k, v.value])) as Record<CharField, string>,
+      };
+      const tmpTags = transientToTags(previewDraft);
+      const clipped = transientToClipTags(previewDraft);
+      const fixedTags = entry ? entryToPromptTags(entry) : '';
+      const merged = mergeTransientTags(fixedTags, clipped, entry ?? null);
+      const expandedNote = clipped !== tmpTags ? `\n(已展开成套词:${clipped})` : '';
+      preview.textContent = merged
+        ? `实际送进 CLIP:${merged}${expandedNote}`
+        : '(空 —— 会用固定档案)';
+    };
+    for (const input of [rawInput, ...fieldInputs.values()]) {
+      input.addEventListener('input', updatePreview);
+    }
+    updatePreview();
+
+    const save = el('button', { class: 'menu_button', type: 'button', text: '保存临时状态' }) as HTMLButtonElement;
+    save.addEventListener('click', () => {
+      const result = saveTransient({
+        name,
+        raw: rawInput.value.trim(),
+        fields: Object.fromEntries([...fieldInputs].map(([k, v]) => [k, v.value.trim()])) as Record<CharField, string>,
+        replace: true,
+        frozen: frozenBox.checked,
+      });
+      toast(result.changed ? `已更新「${name}」的临时档案` : '临时档案没有变化', result.changed ? 'success' : 'info');
+      notify();
+    });
+
+    const clear = el('button', { class: 'menu_button', type: 'button', text: '清空(回到固定档案)' }) as HTMLButtonElement;
+    clear.addEventListener('click', () => {
+      clearTransient(name);
+      toast(`已清空「${name}」的临时档案`, 'success');
+      notify();
+    });
+
+    const cancel = el('button', { class: 'menu_button', type: 'button', text: '收起' }) as HTMLButtonElement;
+    cancel.addEventListener('click', () => transientEditor.classList.add('htj-zz-hide'));
+
+    transientEditor.replaceChildren(
+      el('h5', { text: `临时档案「${name}」` }),
+      el('small', {
+        class: 'htj-zz-hint',
+        text: '这里存「这一刻」的穿戴与状态。整串 tag 会顶掉固定档案里的服装,不会叠加——两串同时进 CLIP 会把衣服糊成一片。',
+      }),
+      el('label', { class: 'htj-zz-field' },
+        el('span', { class: 'htj-zz-label', text: '整串(tag,整串替换)' }),
+        rawInput,
+      ),
+      grid,
+      el('label', { class: 'checkbox_label' }, frozenBox, el('span', { text: '冻结(AI 不再自动改这条)' })),
+      preview,
+      el('div', { class: 'htj-zz-btns' }, save, clear, cancel),
+    );
+    transientEditor.classList.remove('htj-zz-hide');
+    transientEditor.scrollIntoView({ block: 'nearest' });
+  }
+
+  // ---- 临时档案列表 ----
+  const renderTransientList = () => {
+    const transients = getTransients();
+    if (!transients.length) {
+      transientBox.replaceChildren(
+        el('div', {
+          class: 'htj-zz-canvas-empty',
+          text: '还没有临时档案。\n出图时会自动从剧情里读取角色当下的穿戴与状态,也可以点上面某条角色的「临时」手动写。',
+        }),
+      );
+      return;
+    }
+    transientBox.replaceChildren(
+      ...transients.map(tmp => {
+        const tmpTags = transientToTags(tmp);
+        const frozen = el('input', { type: 'checkbox' }) as HTMLInputElement;
+        frozen.checked = tmp.frozen;
+        frozen.addEventListener('change', () => {
+          saveTransient({ name: tmp.name, frozen: frozen.checked });
+          notify();
+        });
+
+        const edit = el('button', { class: 'menu_button', type: 'button', text: '编辑' }) as HTMLButtonElement;
+        edit.addEventListener('click', () => openTransientEditor(tmp.name));
+
+        const clear = el('button', { class: 'menu_button', type: 'button', text: '清空' }) as HTMLButtonElement;
+        clear.addEventListener('click', () => {
+          clearTransient(tmp.name);
+          toast(`已清空「${tmp.name}」的临时档案`, 'success');
+          notify();
+        });
+
+        return el('div', { class: 'htj-zz-charrow' },
+          el('div', { class: 'htj-zz-charrow-main' },
+            el('label', { class: 'checkbox_label' }, frozen, el('b', { text: tmp.name })),
+            el('small', { class: 'htj-zz-hint', text: tmpTags || '(空)' }),
+            el('small', {
+              class: 'htj-zz-hint',
+              text: `楼 #${tmp.floor} · ${tmp.frozen ? '已冻结' : 'AI 可更新'}${tmp.chatId ? ` · ${tmp.chatId.slice(0, 8)}` : ''}`,
+            }),
+          ),
+          el('div', { class: 'htj-zz-btns' }, edit, clear),
+        );
+      }),
+    );
+  };
 
   // ---- 导入 ----
   const importPanel = el('div', { class: 'htj-zz-chareditor htj-zz-hide' });
@@ -261,6 +468,17 @@ export function buildCharsPage(notify: Notify): HTMLElement {
           notify();
         });
 
+        // 临时档案:每个角色一个入口,带内容时按钮上标出来,免得忘了正在覆盖固定服装
+        const tmp = findTransient(getTransients(), entry.name);
+        const tmpTags = transientToTags(tmp);
+        const tmpBtn = el('button', {
+          class: 'menu_button',
+          type: 'button',
+          text: tmpTags ? '临时 ●' : '临时',
+        }) as HTMLButtonElement;
+        tmpBtn.title = tmpTags ? `当前临时状态:${tmpTags}` : '为这个角色新建一条临时档案';
+        tmpBtn.addEventListener('click', () => openTransientEditor(entry.name));
+
         const edit = el('button', { class: 'menu_button', type: 'button', text: '编辑' }) as HTMLButtonElement;
         edit.addEventListener('click', () => openEditor(entry, false));
 
@@ -268,6 +486,7 @@ export function buildCharsPage(notify: Notify): HTMLElement {
         del.addEventListener('click', () => {
           if (!window.confirm(`删除角色档案「${entry.name}」?`)) return;
           deleteCharEntry(entry.name);
+          clearTransient(entry.name);
           toast(`已删除「${entry.name}」`, 'success');
           notify();
         });
@@ -276,15 +495,19 @@ export function buildCharsPage(notify: Notify): HTMLElement {
           el('div', { class: 'htj-zz-charrow-main' },
             el('label', { class: 'checkbox_label' }, toggle, el('b', { text: entry.name })),
             el('small', { class: 'htj-zz-hint', text: summary }),
+            tmpTags
+              ? el('small', { class: 'htj-zz-hint htj-zz-transient-chipline', text: `此刻:${tmpTags}` })
+              : null,
             el('small', { class: 'htj-zz-hint', text: `来源:${entry.source}${entry.note ? ` · ${entry.note}` : ''}` }),
           ),
-          el('div', { class: 'htj-zz-btns' }, edit, del),
+          el('div', { class: 'htj-zz-btns' }, tmpBtn, edit, del),
         );
       }),
     );
   };
 
   renderList();
+  renderTransientList();
 
   root.append(
     // 行为开关
@@ -296,6 +519,35 @@ export function buildCharsPage(notify: Notify): HTMLElement {
       }),
       el('label', { class: 'checkbox_label' }, autoMerge, el('span', { text: '出图时自动拼入在场角色外貌' })),
       el('label', { class: 'checkbox_label' }, autoArchive, el('span', { text: '允许中转站从剧情自动建档(会多一次模型调用)' })),
+    ),
+    // 临时档案:剧情改了穿戴/状态时的那一层
+    el('div', { class: 'htj-zz-cardbox' },
+      el('h4', { text: '临时档案(此刻的状态)' }),
+      el('small', {
+        class: 'htj-zz-hint',
+        text:
+          '固定档案管「她长得什么样」;临时档案管「这一刻她穿着什么、身上有什么」。' +
+          'AI 从剧情里读出变化后写进临时档案,出图时整串送进 ComfyUI 的提示词,并把固定档案里同槽位的旧穿戴顶掉。',
+      }),
+      el('label', { class: 'checkbox_label' }, tEnabled, el('span', { text: '启用临时档案层' })),
+      el('label', { class: 'checkbox_label' }, tAuto, el('span', { text: '每轮让模型从剧情更新临时档案(多一次模型调用)' })),
+      el('label', { class: 'checkbox_label' }, tOverride, el('span', { text: '临时档案覆盖固定档案的穿戴槽位(推荐)' })),
+      el('label', { class: 'checkbox_label' }, tReset, el('span', { text: '换聊天 / 大幅回档时清空临时档案' })),
+      el('label', { class: 'checkbox_label' }, tOnlyKnown, el('span', { text: '只给角色库里已有的角色建档' })),
+      el('div', { class: 'htj-zz-btns' },
+        (() => {
+          const all = el('button', { class: 'menu_button', type: 'button', text: '全部清空' }) as HTMLButtonElement;
+          all.addEventListener('click', () => {
+            if (!window.confirm('清空所有临时档案?(固定档案不受影响)')) return;
+            clearAllTransients();
+            toast('已清空所有临时档案', 'success');
+            notify();
+          });
+          return all;
+        })(),
+      ),
+      transientBox,
+      transientEditor,
     ),
     el('div', { class: 'htj-zz-cardbox' },
       el('div', { class: 'htj-zz-btns' }, importBtn, newBtn),

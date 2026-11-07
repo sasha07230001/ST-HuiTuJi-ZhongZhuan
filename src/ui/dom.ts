@@ -41,6 +41,125 @@ export function ensureStyle(id: string, css: string): void {
   injected.add(id);
 }
 
+/**
+ * 把「恒定画风词 / 恒定负面词」写进工作流模板。
+ *
+ * 为什么需要它:用户的工作流往往把提示词写死在自己那份 JSON 里(比如
+ * `"text": "masterpiece, 1girl, %prompt%"`),而恒定词以前只在运行时拼到
+ * 提示词前面——切到 ComfyUI 原生界面看,工作流里根本没有这两个词。
+ * 这个函数直接改**模板本身**(写进设置里的 comfy.workflow),让 ComfyUI 里
+ * 看到的也是同一份前置词。
+ *
+ * 规则(与运行时合成顺序保持一致):
+ * - 模板里有 %prompt% → 写成「画风词, %prompt%」(幂等:上次写过的同一串不会再叠一层);
+ * - 没有 `%prompt%`(定位式) → 找 CLIP 节点:第一个非空的当正向,其余当负面;
+ * - 负面同理,用 `%negative_prompt%` 或其余 CLIP 节点。
+ *
+ * 只动 CLIP 文本,模型/采样器/LoRA 一个字节都不碰。
+ */
+export function applyConstantWordsToWorkflow(
+  template: string,
+  positiveHead: string,
+  negativeHead: string,
+): { ok: boolean; changed: boolean; message: string; template: string } {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(template) as Record<string, unknown>;
+  } catch (error) {
+    return {
+      ok: false,
+      changed: false,
+      template,
+      message: `工作流不是合法 JSON:${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (!parsed || typeof parsed !== 'object' || Object.keys(parsed).length === 0) {
+    return { ok: false, changed: false, template, message: '工作流是空的,先在「渠道」页粘一份 Save (API Format) 导出' };
+  }
+
+  const head = String(positiveHead ?? '').trim();
+  const negHead = String(negativeHead ?? '').trim();
+
+  /** 恒定词永远排在模板最前面;上次写过的同一串不再叠一层。 */
+  const withHead = (value: string, words: string): string => {
+    if (!words) return value;
+    if (value.trim().toLowerCase().startsWith(words.toLowerCase())) return value;
+    return `${words}, ${value}`;
+  };
+
+  let changed = false;
+  const clipNodes: Array<{ id: string; text: string; filled: boolean }> = [];
+
+  for (const [id, node] of Object.entries(parsed)) {
+    if (!node || typeof node !== 'object') continue;
+    const n = node as { class_type?: unknown; inputs?: Record<string, unknown> };
+    if (!n.inputs || typeof n.inputs !== 'object') continue;
+    if (typeof n.class_type !== 'string' || !/clip(text)?encode|textencod/i.test(n.class_type)) continue;
+    const text = n.inputs.text;
+    if (typeof text !== 'string') continue;
+    clipNodes.push({ id, text, filled: !!text.trim() });
+  }
+
+  // 1) 占位符式:直接改模板里带 %prompt% / %negative_prompt% 的那几个节点
+  for (const name of ['prompt', 'negative_prompt'] as const) {
+    const marker = `%${name}%`;
+    let hit = false;
+    for (const [id, node] of Object.entries(parsed)) {
+      if (!node || typeof node !== 'object') continue;
+      const n = node as { inputs?: Record<string, unknown> };
+      if (!n.inputs || typeof n.inputs !== 'object') continue;
+      const text = n.inputs.text;
+      if (typeof text !== 'string' || !text.includes(marker)) continue;
+      const next = withHead(text, name === 'prompt' ? head : negHead);
+      if (next !== text) {
+        n.inputs.text = next;
+        changed = true;
+      }
+      hit = true;
+    }
+    if (hit) continue;
+    // 2) 定位式:没有该占位符时,按「第一个非空 = 正向,其余 = 负面」落进去
+    if (name === 'prompt') {
+      const target = clipNodes.find(x => x.filled) ?? clipNodes[0];
+      if (target) {
+        const current = (parsed[target.id] as { inputs: Record<string, unknown> }).inputs.text as string;
+        const next = current.trim() ? `${head}, ${current}` : head;
+        if (next !== current) {
+          (parsed[target.id] as { inputs: Record<string, unknown> }).inputs.text = next;
+          changed = true;
+        }
+      }
+    } else if (clipNodes.length > 1) {
+      for (const node of clipNodes.slice(1)) {
+        const current = (parsed[node.id] as { inputs: Record<string, unknown> }).inputs.text as string;
+        const next = current.trim() ? `${negHead}, ${current}` : negHead;
+        if (next !== current) {
+          (parsed[node.id] as { inputs: Record<string, unknown> }).inputs.text = next;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  if (!clipNodes.length && !/%prompt%/.test(template)) {
+    return {
+      ok: false,
+      changed: false,
+      template,
+      message: '工作流里既没有 %prompt% 也没有 CLIPTextEncode,不知道该把恒定词写到哪里',
+    };
+  }
+
+  if (!changed) return { ok: true, changed: false, template, message: '工作流里已经是这两个恒定词了,无需改动' };
+  return {
+    ok: true,
+    changed: true,
+    template: JSON.stringify(parsed, null, 2),
+    message: '恒定词已前置写入工作流的 CLIP 文本',
+  };
+}
+
+
 /** toastr 存在就用它,否则退回 console。 */
 export function toast(message: string, kind: 'info' | 'success' | 'warning' | 'error' = 'info', title = '绘图姬·中转站'): void {
   const t = (window as unknown as { toastr?: Record<string, (msg: string, title: string) => void> }).toastr;
@@ -201,10 +320,222 @@ export const UI_CSS = `
   background: rgba(124,92,255,.06);
 }
 .htj-zz-chareditor h5 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+/* 临时档案行:用左侧色条区分「此刻状态」与固定档案 */
+.htj-zz-transient-chipline {
+  color: #ffb0d0;
+  opacity: .9;
+  border-left: 2px solid #ff5c9d;
+  padding-left: 6px;
+}
+.htj-zz-charlist + .htj-zz-btns { margin-top: 10px; }
 .htj-zz-importrow { display: flex; align-items: baseline; gap: 6px; padding: 4px 0; }
-@media (max-width: 640px) {
-  .htj-zz-panel-mask { padding: 0; }
-  .htj-zz-panel { width: 100%; height: 100%; border-radius: 0; }
+
+/* ---- 分段预览 ---- */
+.htj-zz-segments { display: flex; flex-direction: column; gap: 6px; }
+.htj-zz-segment-row {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 6px 8px;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.1));
+  border-left: 3px solid rgba(124,92,255,.65);
+  border-radius: 8px;
+  background: rgba(255,255,255,.02);
+}
+.htj-zz-segment-text { flex: 1 1 240px; min-width: 0; word-break: break-word; }
+.htj-zz-subhead { margin: 14px 0 6px; font-size: 13px; font-weight: 600; }
+.htj-zz-prompt-preview { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 10px; word-break: break-word; }
+.htj-zz-prompt-preview div:first-child { color: #c9b6ff; }
+.htj-zz-field-narrow { flex: 0 0 96px; }
+
+/* ---- 图库 ---- */
+.htj-zz-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.htj-zz-gallery-card {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.12));
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255,255,255,.02);
+  min-width: 0;
+}
+.htj-zz-gallery-thumb { display: block; }
+.htj-zz-gallery-thumb img {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  border-radius: 8px;
+  display: block;
+}
+.htj-zz-gallery-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.htj-zz-gallery-body .htj-zz-hint { word-break: break-word; }
+.htj-zz-gallery-body .htj-zz-btns { gap: 4px; }
+.htj-zz-gallery-body .menu_button { font-size: 12px; padding: 4px 8px; }
+.htj-zz-gallery-prompt {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.htj-zz-warn {
+  grid-column: 1 / -1;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 176, 32, .55);
+  background: rgba(255, 176, 32, .12);
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+/* ---- 楼层被「插回正文」定位到时闪一下 ---- */
+@keyframes htj-zz-flash { 0%,100% { background-color: transparent; } 30% { background-color: rgba(124,92,255,.18); } }
+.htj-zz-flash { animation: htj-zz-flash 1.1s ease-out 1; border-radius: 10px; }
+
+/* ---- 恒定词横幅(出图页顶部,证明当前生效的是哪一串) ---- */
+.htj-zz-constbar {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border-left: 3px solid rgba(124,92,255,.7);
+  background: rgba(124,92,255,.08);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
+  margin-bottom: 10px;
+}
+.htj-zz-constbar b { font-weight: 600; opacity: .85; }
+
+/* ---- 移动端 ----
+ * 三条硬约束(不满足就是「手机上没法用」):
+ * 1. 面板必须满屏 + 用 dvh:移动浏览器的地址栏会伸缩,100vh 会漏掉一截,
+ *    底部按钮被顶到屏幕外。
+ * 2. 输入框字号 ≥16px:iOS Safari 对 <16px 的输入框会自动放大整个页面。
+ * 3. 触摸目标 ≥44px:手指比鼠标粗得多,原本 8px 内边距的按钮点不准。
+ */
+@media (max-width: 720px) {
+  .htj-zz-panel-mask {
+    padding: 0;
+    align-items: stretch;
+    justify-content: stretch;
+  }
+  .htj-zz-panel {
+    width: 100%;
+    height: 100dvh;
+    max-height: 100dvh;
+    border-radius: 0;
+    border: none;
+    font-size: 15px;
+  }
+  .htj-zz-panel-head {
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+    gap: 8px;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  .htj-zz-panel-sub { display: none; }
+  .htj-zz-tabs {
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 6px 8px 0;
+    gap: 2px;
+  }
+  .htj-zz-tabs::-webkit-scrollbar { display: none; }
+  .htj-zz-tab {
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: 8px 12px;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  .htj-zz-panel-body {
+    padding: 12px 12px calc(16px + env(safe-area-inset-bottom));
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+  .htj-zz-panel-foot {
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+  }
+  .htj-zz-panel input.text_pole,
+  .htj-zz-panel select.text_pole,
+  .htj-zz-panel textarea.text_pole {
+    font-size: 16px;   /* 低于 16px 时 iOS 会自动放大整页 */
+    min-height: 42px;
+  }
+  .htj-zz-panel textarea.htj-zz-textarea { min-height: 120px; }
+  .htj-zz-panel .menu_button {
+    min-height: 42px;
+    padding: 8px 14px;
+    font-size: 14px;
+    touch-action: manipulation;
+  }
+  .htj-zz-btns { gap: 8px; }
+  .htj-zz-btns .menu_button { flex: 1 1 auto; }
+  .htj-zz-field { flex: 1 1 100%; }
+  .htj-zz-field-narrow { flex: 1 1 calc(50% - 5px); }
   .htj-zz-grid2 { grid-template-columns: 1fr; }
+  .htj-zz-canvas { min-height: 160px; padding: 8px; }
+  .htj-zz-canvas img { max-height: 45dvh; }
+  .htj-zz-gallery { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .htj-zz-orb { touch-action: none; }
+  /* 图库卡片在手机上按钮会挤:改成 2 列自然换行、按钮铺满一行 */
+  .htj-zz-gallery-body .htj-zz-btns .menu_button { flex: 1 1 40%; font-size: 13px; min-height: 40px; }
+  .htj-zz-segment-row { align-items: flex-start; }
+  .htj-zz-segment-text { flex: 1 1 100%; }
+  .htj-zz-constbar { font-size: 12px; }
+  .htj-zz-warn { font-size: 13px; }
+}
+
+/* 触摸屏(平板也包括,不一定 <720px):输入框 16px 防 iOS 缩放、按钮给足高度 */
+@media (pointer: coarse) {
+  .htj-zz-panel input.text_pole,
+  .htj-zz-panel select.text_pole,
+  .htj-zz-panel textarea.text_pole {
+    font-size: 16px;
+    min-height: 42px;
+  }
+  .htj-zz-panel .menu_button {
+    min-height: 42px;
+    padding: 8px 14px;
+    touch-action: manipulation;
+  }
+  .htj-zz-panel input,
+  .htj-zz-panel textarea,
+  .htj-zz-panel select {
+    /* 关掉双击缩放带来的 300ms 延迟;双击悬浮球回默认位置照样工作 */
+    touch-action: manipulation;
+  }
+  .htj-zz-orb {
+    /* 触摸设备上球体本身再放大一点,免得指甲盖盖住半个 */
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
+/* iOS 安全区:面板贴底时底栏被手势条挡住 */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .htj-zz-panel-foot { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+}
+
+@media (max-width: 420px) {
+  .htj-zz-panel-title { font-size: 14px; }
+  .htj-zz-gallery { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+}
+
+/* 触摸设备没有 hover:贴边半隐会让球永远只露一半,手指很难点 —— 一律整颗显示 */
+@media (hover: none) {
+  .htj-zz-orb { opacity: 1 !important; }
+}
+
+/* 横屏矮屏:标题和页脚都很挤,优先把高度让给内容 */
+@media (max-height: 520px) and (orientation: landscape) {
+  .htj-zz-panel { height: 100dvh; border-radius: 0; }
+  .htj-zz-panel-head { padding-top: 6px; padding-bottom: 6px; }
+  .htj-zz-panel-foot { display: none; }
 }
 `;
