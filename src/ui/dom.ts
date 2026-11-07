@@ -330,6 +330,26 @@ export const UI_CSS = `
 .htj-zz-charlist + .htj-zz-btns { margin-top: 10px; }
 .htj-zz-importrow { display: flex; align-items: baseline; gap: 6px; padding: 4px 0; }
 
+/* ---- 初始化失败的横幅:模块内抛错不会进界面,至少留个能点的痕迹 ---- */
+.htj-zz-fatal {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 2147483002;
+  max-width: min(420px, calc(100vw - 24px));
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 92, 92, .6);
+  background: rgba(40, 12, 12, .94);
+  color: #ffd9d9;
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-word;
+  cursor: pointer;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+}
+.htj-zz-fatal b { display: block; margin-bottom: 4px; color: #ff8a8a; }
+
 /* ---- 分段预览 ---- */
 .htj-zz-segments { display: flex; flex-direction: column; gap: 6px; }
 .htj-zz-segment-row {

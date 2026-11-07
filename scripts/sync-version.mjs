@@ -34,3 +34,20 @@ if (changed) {
 } else {
   console.log(`[sync-version] 已是 v${version}`);
 }
+
+/**
+ * 顺手校验「manifest 说的 js」到底在不在。
+ *
+ * 这是踩过的最贵的一个坑:manifest 写着 `dist/index.js?ver=0.6.0`,
+ * 而 dist/ 根本没构建 / 没跟着仓库走 —— 酒馆 `<script type="module">` 直接 404,
+ * 既不报错到界面上,也不进扩展列表的警告,用户看到的就是「装了但完全没反应」。
+ * 这里一旦发现缺产物就红字警告,别让它静静过。
+ */
+const jsFile = path.join(root, 'dist', js.split('?')[0]);
+if (!fs.existsSync(jsFile)) {
+  console.error('');
+  console.error('  ⚠ manifest.json 指向的构建产物不存在:' + path.relative(root, jsFile));
+  console.error('    酒馆会在加载扩展时 404,表现为「装了但没有任何反应」。');
+  console.error('    修法:npm run build,然后 npm run track-dist(把产物提交进仓库)。');
+  console.error('');
+}

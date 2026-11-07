@@ -21,6 +21,8 @@
     "sync-version": "node scripts/sync-version.mjs",
     "prebuild": "node scripts/sync-version.mjs",
     "build": "vite build",
+    "postbuild": "node scripts/track-dist.mjs",
+    "track-dist": "node scripts/track-dist.mjs",
     "prewatch": "node scripts/sync-version.mjs",
     "watch": "vite build --watch --mode development",
     "typecheck": "tsc --noEmit",

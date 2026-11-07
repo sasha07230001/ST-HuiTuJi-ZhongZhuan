@@ -9,6 +9,7 @@
 
 import { getSettings, configProblems, isProbablyReady } from '@/state/settings';
 import { getContext, waitForContext } from '@/st/context';
+import { UI_CSS, el, ensureStyle } from '@/ui/dom';
 import { autoIllustrateState, bindAutoIllustrate } from '@/ui/autoIllustrate';
 import { hydrateAll, hasLegacyPlaceholder, illustrateFloor, resetFloorCards, stripCardPlaceholders } from '@/ui/card';
 import { bindFloorButtons, decorateAllFloors } from '@/ui/floorButton';
@@ -22,6 +23,59 @@ const VERSION = typeof __HTJ_ZZ_VERSION__ === 'string' ? __HTJ_ZZ_VERSION__ : 'd
 
 /** 上一次提示过的「配置不齐」内容,避免每次生成都弹一遍。 */
 let notReadyWarned = '';
+
+/** 加载失败的横幅 id(整个扩展没能初始化时才出现)。 */
+const FATAL_ID = 'htj-zz-fatal';
+
+/**
+ * 最后一道兜底:整个扩展初始化失败时,页面上必须留点痕迹。
+ *
+ * 为什么需要:ST 用 `<script type="module">` 加载扩展,模块内抛错**不会**弹到界面上,
+ * 只会进控制台。用户看到的是「装了,但酒馆里什么都没有」,而扩展自己在扩展列表里
+ * 还是「已启用」状态 —— 完全无从下手。这里把错误打到页面上一块可点的横幅,
+ * 至少能知道是加载失败、失败在哪一行。
+ */
+function mountFatal(reason: string): void {
+  try {
+    ensureStyle('htj-zz-ui', UI_CSS);
+  } catch {
+    /* 连样式都注入不了就只写文字 */
+  }
+  if (document.getElementById(FATAL_ID)) return;
+  const box = el('div', {
+    id: FATAL_ID,
+    class: 'htj-zz-fatal',
+    title: '点一下复制错误信息',
+  }) as HTMLDivElement;
+  box.append(
+    el('b', { text: '绘图姬·中转站:扩展没有初始化成功' }),
+    el('div', { text: reason }),
+    el('small', { text: `版本 ${VERSION} · 点这里复制错误信息,贴给作者排查` }),
+  );
+  box.addEventListener('click', () => {
+    const text = `[绘图姬·中转站] v${VERSION} 初始化失败:${reason}\nUA:${navigator.userAgent}`;
+    void navigator.clipboard?.writeText(text);
+  });
+  document.body.append(box);
+}
+
+function fatal(reason: string): void {
+  console.error(`[${TITLE}] 初始化失败:${reason}`);
+  mountFatal(reason);
+}
+
+window.addEventListener?.('error', event => {
+  const text = String((event as ErrorEvent).message ?? '');
+  // 只抓自己的:别人的报错不该由我们挂横幅
+  if (!/htj|绘图姬/i.test(text) && !/dist\/index\.js/.test(String((event as ErrorEvent).filename ?? ''))) return;
+  fatal(`运行时错误:${text}`);
+});
+window.addEventListener?.('unhandledrejection', event => {
+  const reason = (event as PromiseRejectionEvent).reason;
+  const text = reason instanceof Error ? reason.message : String(reason);
+  if (!/htj|绘图姬|index\.js/i.test(text)) return;
+  fatal(`未处理的 Promise 拒绝:${text}`);
+});
 
 function info(message: string): void {
   console.log(`[${TITLE}] ${message}`);
@@ -217,7 +271,9 @@ async function boot(): Promise<void> {
   info(`v${VERSION} 已加载`);
 }
 
-void boot();
+void boot().catch(error => {
+  fatal(error instanceof Error ? `${error.name}: ${error.message}\n${error.stack?.split('\n').slice(0, 3).join('\n') ?? ''}` : String(error));
+});
 
 /** 给控制台/其它插件用的小入口。 */
 const globalThisAny = globalThis as unknown as Record<string, unknown>;

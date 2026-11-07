@@ -55,7 +55,12 @@ npm run build
 
 然后**重启 SillyTavern**(`node server.js` 那一下)。扩展列表里会出现「绘图姬·中转站」。
 
-> `dist/index.js` 需要构建产物。如果你是直接下载的 zip,执行一次 `npm install && npm run build` 即可。
+> **为什么必须 build 一次**:`dist/` 是构建产物,仓库里只提交了 `dist/index.js` 这一个文件。
+> `git pull` 之后如果没有重新 build,酒馆加载的还是上一版产物 —— 表现为「拉下来了,但所有新功能都没有」。
+> 每次更新都跑一次 `npm install && npm run build`(build 完会自动 `git add -f dist/index.js`)。
+>
+> 如果页面右下角出现红色横幅「绘图姬·中转站:扩展没有初始化成功」,说明 JS 已经加载但在初始化时抛错,
+> 点一下横幅可以复制错误信息。
 
 ---
 
