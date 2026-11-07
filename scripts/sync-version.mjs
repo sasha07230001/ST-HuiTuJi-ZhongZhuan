@@ -43,7 +43,7 @@ if (changed) {
  * 既不报错到界面上,也不进扩展列表的警告,用户看到的就是「装了但完全没反应」。
  * 这里一旦发现缺产物就红字警告,别让它静静过。
  */
-const jsFile = path.join(root, 'dist', js.split('?')[0]);
+const jsFile = path.join(root, js.replace(/\?.*$/, ''));
 if (!fs.existsSync(jsFile)) {
   console.error('');
   console.error('  ⚠ manifest.json 指向的构建产物不存在:' + path.relative(root, jsFile));

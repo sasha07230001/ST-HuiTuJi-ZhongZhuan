@@ -3,9 +3,9 @@
   "loading_order": 100,
   "requires": [],
   "optional": [],
-  "js": "dist/index.js?ver=0.6.0",
+  "js": "dist/index.js?ver=0.6.1",
   "author": "sasha07230001",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "homePage": "https://github.com/sasha07230001/ST-HuiTuJi-ZhongZhuan",
   "auto_update": false,
   "minimum_client_version": "1.12.13"
